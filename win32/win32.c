@@ -5930,6 +5930,48 @@ winnt_stat(const WCHAR *path, struct stati128 *st, BOOL lstat)
     return 0;
 }
 
+
+#define CACHE_SIZE 1000
+
+struct stati128 st_cache[CACHE_SIZE];
+WCHAR path_cache[CACHE_SIZE][PATH_MAX];
+int result_cache[CACHE_SIZE];
+int cache_count = 0;
+
+int cached_winnt_stat(const WCHAR *path, struct stati128 *st, BOOL lstat) {
+    // Check if the path is already in the cache
+    for (int i = 0; i < cache_count; i++) {
+        if (wcscmp(path, path_cache[i]) == 0) {
+            memcpy(st, &st_cache[i], sizeof(struct stati128));
+            return result_cache[i];
+        }
+    }
+
+    int result = winnt_stat(path, st, lstat);
+    if (result == 0) {
+        // If the cache is not full, add the path, stat info and result to the cache
+        if (cache_count < CACHE_SIZE) {
+            wcscpy(path_cache[cache_count], path);
+            memcpy(&st_cache[cache_count], st, sizeof(struct stati128));
+            result_cache[cache_count] = result;
+            cache_count++;
+        }
+        else {
+            // If the cache is full, replace the oldest entry with the new path, stat info and result
+            for (int i = 0; i < CACHE_SIZE - 1; i++) {
+                wcscpy(path_cache[i], path_cache[i + 1]);
+                memcpy(&st_cache[i], &st_cache[i + 1], sizeof(struct stati128));
+                result_cache[i] = result_cache[i + 1];
+            }
+            wcscpy(path_cache[CACHE_SIZE - 1], path);
+            memcpy(&st_cache[CACHE_SIZE - 1], st, sizeof(struct stati128));
+            result_cache[CACHE_SIZE - 1] = result;
+        }
+    }
+    return result;
+}
+
+
 /* License: Ruby's */
 int
 rb_w32_stat(const char *path, struct stat *st)
@@ -5957,7 +5999,7 @@ wstati128(const WCHAR *path, struct stati128 *st, BOOL lstat)
     buf1 = ALLOCV_N(WCHAR, v, size);
     if (!(path = name_for_stat(buf1, path)))
         return -1;
-    ret = winnt_stat(path, st, lstat);
+    ret = cached_winnt_stat(path, st, lstat);
     if (v)
         ALLOCV_END(v);
 
