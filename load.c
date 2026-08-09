@@ -1305,7 +1305,7 @@ rb_ext_ractor_safe(bool flag)
  * >1: exception
  */
 static int
-require_internal(rb_execution_context_t *ec, VALUE fname, int exception, bool warn)
+require_internal_unguarded(rb_execution_context_t *ec, VALUE fname, int exception, bool warn)
 {
     volatile int result = -1;
     rb_thread_t *th = rb_ec_thread_ptr(ec);
@@ -1423,6 +1423,59 @@ require_internal(rb_execution_context_t *ec, VALUE fname, int exception, bool wa
     RUBY_DTRACE_HOOK(REQUIRE_RETURN, RSTRING_PTR(fname));
 
     return result;
+}
+
+/* Wrapper that disables GC for the duration of a require chain. Native
+ * extension-heavy requires (gtk3 et al.) trigger ~64 GCs during load due to
+ * high allocation rates, adding ~17% wall-clock. Disabling GC for the
+ * outermost require lets all those allocations stack up; the runtime then
+ * reclaims everything on its normal schedule once the require returns.
+ *
+ * Uses rb_ensure so the GC state is restored even if the require chain
+ * raises. If GC was already disabled before entry (user code or an outer
+ * require already disabled it), this call is a no-op pass-through. */
+struct require_dispatch {
+    rb_execution_context_t *ec;
+    VALUE fname;
+    int exception;
+    bool warn;
+    int result;
+};
+
+static VALUE
+require_internal_body(VALUE data_val)
+{
+    struct require_dispatch *d = (struct require_dispatch *)data_val;
+    d->result = require_internal_unguarded(d->ec, d->fname, d->exception, d->warn);
+    return Qnil;
+}
+
+static VALUE
+require_gc_reenable(VALUE was_disabled_val)
+{
+    /* Was GC enabled before we disabled it? rb_gc_disable() returns the
+     * PRIOR state: Qtrue if it was already disabled, Qfalse if it was
+     * enabled (we just turned it off). Re-enable only in the latter case. */
+    if (was_disabled_val == Qfalse) rb_gc_enable();
+    return Qnil;
+}
+
+static int
+require_internal(rb_execution_context_t *ec, VALUE fname, int exception, bool warn)
+{
+    struct require_dispatch d = { ec, fname, exception, warn, -1 };
+    VALUE was_disabled = rb_gc_disable();
+    if (was_disabled == Qfalse) {
+        rb_ensure(require_internal_body, (VALUE)&d,
+                  require_gc_reenable, was_disabled);
+    }
+    else {
+        /* Already disabled by user code or outer require — call directly so
+         * we don't burn the rb_ensure overhead and don't accidentally
+         * re-enable on exit. */
+        require_internal_body((VALUE)&d);
+    }
+    return d.result;
 }
 
 int
