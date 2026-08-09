@@ -5951,6 +5951,22 @@ fn jit_rb_str_length(
     true
 }
 
+/// Read a C `long`-width length field (RSTRING_LEN, RARRAY heap len) as a full
+/// VALUE-width operand. On LP64 `long` is already VALUE-width; on LLP64
+/// (Windows) it is 32-bit, so read a full word at the offset and mask to the
+/// low `long` bits. Lengths are non-negative, so this zero-extends correctly
+/// and avoids mixing a 32-bit field with 64-bit operands (which would trip the
+/// backend's operand-size assertions).
+fn load_long_len_field(asm: &mut Assembler, base: Opnd, offset: i32) -> Opnd {
+    let long_bits = std::os::raw::c_long::BITS as u8;
+    if long_bits < VALUE_BITS {
+        let raw = Opnd::mem(VALUE_BITS, base, offset);
+        asm.and(raw, ((1u64 << long_bits) - 1).into())
+    } else {
+        asm.load(Opnd::mem(long_bits, base, offset))
+    }
+}
+
 fn jit_rb_str_bytesize(
     _jit: &mut JITState,
     asm: &mut Assembler,
@@ -5965,13 +5981,8 @@ fn jit_rb_str_bytesize(
     let recv = asm.stack_pop(1);
 
     asm_comment!(asm, "get string length");
-    let str_len_opnd = Opnd::mem(
-        std::os::raw::c_long::BITS as u8,
-        asm.load(recv),
-        RUBY_OFFSET_RSTRING_LEN as i32,
-    );
-
-    let len = asm.load(str_len_opnd);
+    let str_reg = asm.load(recv);
+    let len = load_long_len_field(asm, str_reg, RUBY_OFFSET_RSTRING_LEN as i32);
     let shifted_val = asm.lshift(len, Opnd::UImm(1));
     let out_val = asm.or(shifted_val, Opnd::UImm(RUBY_FIXNUM_FLAG as u64));
 
@@ -6138,11 +6149,7 @@ fn jit_rb_str_getbyte(
 
     asm_comment!(asm, "get string length");
     let recv = asm.load(recv);
-    let str_len_opnd = Opnd::mem(
-        std::os::raw::c_long::BITS as u8,
-        asm.load(recv),
-        RUBY_OFFSET_RSTRING_LEN as i32,
-    );
+    let str_len_opnd = load_long_len_field(asm, recv, RUBY_OFFSET_RSTRING_LEN as i32);
 
     // Exit if the index is out of bounds
     asm.cmp(idx, str_len_opnd);
