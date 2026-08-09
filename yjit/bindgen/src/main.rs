@@ -62,6 +62,13 @@ fn main() {
         .blocklist_type("size_t")
         .blocklist_type("fpos_t")
 
+        // Ruby defines these as pointer-width integer types. Keep the checked-in
+        // bindings portable when generated on LP64 and compiled on LLP64.
+        .blocklist_type("ID")
+        .blocklist_type("st_data_t")
+        .raw_line("pub type ID = usize;")
+        .raw_line("pub type st_data_t = usize;")
+
         // Import YARV bytecode instruction constants
         .allowlist_type("ruby_vminsn_type")
 
