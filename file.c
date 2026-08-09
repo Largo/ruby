@@ -4860,9 +4860,37 @@ rb_check_realpath_emulate_rescue(VALUE arg, VALUE exc)
 # define NEEDS_REALPATH_BUFFER 1
 #endif /* HAVE_REALPATH */
 
+#ifdef _WIN32
+/* In win32/win32.c. Returns a malloc-allocated UTF-8 canonical path on
+ * success, or NULL when the path is relative / does not exist / cannot be
+ * opened. Falls through to the emulated walker in those cases. */
+extern char *rb_w32_realpath(const char *);
+#endif
+
 static VALUE
 rb_check_realpath_internal(VALUE basedir, VALUE path, rb_encoding *origenc, enum rb_realpath_mode mode)
 {
+#ifdef _WIN32
+    /* Fast path: GetFinalPathNameByHandleW-based canonicalization in
+     * win32/win32.c. Replaces the per-component stat walk of
+     * rb_check_realpath_emulate for absolute paths that resolve. */
+    if (mode != RB_REALPATH_DIR) {
+        VALUE w_path = rb_str_dup_frozen(path);
+        if (*RSTRING_PTR(w_path) != '/' && !NIL_P(basedir)) {
+            VALUE paths[2] = {basedir, w_path};
+            w_path = rb_file_join(2, paths);
+        }
+        char *canon = rb_w32_realpath(RSTRING_PTR(w_path));
+        if (canon) {
+            VALUE resolved = rb_str_new_cstr(canon);
+            free(canon); /* matches malloc in rb_w32_realpath */
+            rb_enc_associate(resolved, origenc ? origenc : rb_filesystem_encoding());
+            return resolved;
+        }
+        /* canon == NULL: relative path, doesn't exist, access denied, etc.
+         * fall through to slow walker which handles all those cases. */
+    }
+#endif
 #ifdef HAVE_REALPATH
     VALUE unresolved_path;
     char *resolved_ptr = NULL;
