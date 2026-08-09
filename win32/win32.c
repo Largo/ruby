@@ -6399,10 +6399,16 @@ char *
 rb_w32_realpath(const char *path)
 {
     InterlockedIncrement(&g_w32_count_realpath);
-    WCHAR *wpath = NULL;
+    /* Stack buffers for both conversions: realpath runs once per file added
+     * to $LOADED_FEATURES, and typical paths fit comfortably. This also
+     * saves the sizing call of GetFinalPathNameByHandleW (one syscall of
+     * the previous four). Long paths fall back to the heap. */
+    WCHAR wbuf[PATH_MAX + 8];
+    WCHAR outstack[PATH_MAX + 8];
+    WCHAR *wpath = wbuf;
     WCHAR *buf = NULL;
     HANDLE h = INVALID_HANDLE_VALUE;
-    DWORD len, len2;
+    DWORD len2;
     char *result = NULL;
     WCHAR *out;
 
@@ -6413,44 +6419,51 @@ rb_w32_realpath(const char *path)
           (path[2] == '\\' || path[2] == '/')))
         return NULL;
 
-    if (!(wpath = mbstr_to_wstr(CP_UTF8, path, -1, NULL))) return NULL;
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wbuf, numberof(wbuf))) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) return NULL;
+        if (!(wpath = mbstr_to_wstr(CP_UTF8, path, -1, NULL))) return NULL;
+    }
 
     h = CreateFileW(wpath, 0,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     NULL, OPEN_EXISTING,
                     /* BACKUP_SEMANTICS so directories also open */
                     FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    free(wpath);
+    if (wpath != wbuf) free(wpath);
     if (h == INVALID_HANDLE_VALUE) {
         errno = map_errno(GetLastError());
         return NULL;
     }
 
-    len = GetFinalPathNameByHandleW(h, NULL, 0, FILE_NAME_NORMALIZED);
-    if (len == 0) {
+    out = outstack;
+    len2 = GetFinalPathNameByHandleW(h, outstack, numberof(outstack), FILE_NAME_NORMALIZED);
+    if (len2 == 0) {
         errno = map_errno(GetLastError());
         CloseHandle(h);
         return NULL;
     }
-
-    buf = (WCHAR *)malloc(sizeof(WCHAR) * (len + 1));
-    if (!buf) { CloseHandle(h); return NULL; }
-
-    len2 = GetFinalPathNameByHandleW(h, buf, len, FILE_NAME_NORMALIZED);
-    CloseHandle(h);
-    if (len2 == 0 || len2 >= len) {
-        free(buf);
-        return NULL;
+    if (len2 >= numberof(outstack)) {
+        /* Buffer too small: len2 is the required size incl. the NUL. */
+        buf = (WCHAR *)malloc(sizeof(WCHAR) * (len2 + 1));
+        if (!buf) { CloseHandle(h); return NULL; }
+        DWORD need = len2 + 1;
+        len2 = GetFinalPathNameByHandleW(h, buf, need, FILE_NAME_NORMALIZED);
+        if (len2 == 0 || len2 >= need) {
+            free(buf);
+            CloseHandle(h);
+            return NULL;
+        }
+        out = buf;
     }
+    CloseHandle(h);
 
     /* GetFinalPathNameByHandleW returns paths prefixed with the NT namespace
      * indicator "\\?\" (or "\\?\UNC\" for shares). Strip "\\?\" for drive
      * letter paths so callers see the familiar "C:\foo\bar" form. */
-    out = buf;
-    if (len2 > 4 && wcsncmp(buf, L"\\\\?\\", 4) == 0) {
+    if (len2 > 4 && wcsncmp(out, L"\\\\?\\", 4) == 0) {
         /* leave "\\?\UNC\..." alone — those are network paths */
-        if (!(len2 > 8 && wcsncmp(buf + 4, L"UNC\\", 4) == 0)) {
-            out = buf + 4;
+        if (!(len2 > 8 && wcsncmp(out + 4, L"UNC\\", 4) == 0)) {
+            out += 4;
         }
     }
 
@@ -6469,13 +6482,22 @@ rb_w32_realpath(const char *path)
 static int
 w32_stati128(const char *path, struct stati128 *st, UINT cp, BOOL lstat)
 {
-    WCHAR *wpath;
+    /* Stat runs thousands of times per `require`; paths are almost always
+     * < PATH_MAX, so convert into a stack buffer and skip the per-call
+     * malloc/free. Oversized or invalid paths fall back to the heap path. */
+    WCHAR wbuf[PATH_MAX + 8];
+    WCHAR *wpath = wbuf;
     int ret;
 
-    if (!(wpath = mbstr_to_wstr(cp, path, -1, NULL)))
-        return -1;
+    if (!MultiByteToWideChar(cp, 0, path, -1, wbuf, numberof(wbuf))) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+            return -1;
+        if (!(wpath = mbstr_to_wstr(cp, path, -1, NULL)))
+            return -1;
+    }
     ret = wstati128(wpath, st, lstat);
-    free(wpath);
+    if (wpath != wbuf)
+        free(wpath);
     return ret;
 }
 
