@@ -590,11 +590,27 @@ rb_file_load_ok(const char *path)
 {
     DWORD attr;
     int ret = 1;
-    long len;
-    wchar_t* wpath;
+    wchar_t stack_buf[260 + 16]; /* MAX_PATH + slack */
+    wchar_t *wpath;
+    int wpath_on_heap = 0;
 
-    wpath = mbstr_to_wstr(CP_UTF8, path, -1, &len);
-    if (!wpath) return 0;
+    /* Stack-buffer fast path for typical-length paths. rb_file_load_ok is
+     * called ~2000 times during a heavy `require`; skipping the malloc /
+     * free pair for ~90%+ of paths (anything under ~MAX_PATH) avoids
+     * thousands of heap allocations per startup. */
+    int upper = (int)strlen(path) + 1;
+    if (upper <= (int)(sizeof(stack_buf) / sizeof(stack_buf[0]))) {
+        int converted = MultiByteToWideChar(CP_UTF8, 0, path, -1,
+                                            stack_buf, upper);
+        if (!converted) return 0;
+        wpath = stack_buf;
+    }
+    else {
+        long len;
+        wpath = mbstr_to_wstr(CP_UTF8, path, -1, &len);
+        if (!wpath) return 0;
+        wpath_on_heap = 1;
+    }
 
     /* Called for every successful $LOAD_PATH candidate during `require`.
      * Original code did GetFileAttributesW + CreateFileW + CloseHandle —
@@ -627,7 +643,7 @@ rb_file_load_ok(const char *path)
         }
     }
     /* else: regular file, attribute check is sufficient. ret stays 1. */
-    free(wpath);
+    if (wpath_on_heap) free(wpath);
     return ret;
 }
 
