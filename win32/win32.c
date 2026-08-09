@@ -844,6 +844,10 @@ static int w32_cmdvector(const WCHAR *, char ***, UINT, rb_encoding *);
 // Initialization stuff
 //
 /* License: Ruby's */
+/* Set by rb_w32_sysinit when RUBY_DLL_PATH is set and user-dirs DLL search
+ * is active. Read by dln.c to choose LoadLibraryExW flags. */
+int g_w32_use_user_dll_dirs = 0;
+
 void
 rb_w32_sysinit(int *argc, char ***argv)
 {
@@ -873,6 +877,36 @@ rb_w32_sysinit(int *argc, char ***argv)
 
     // Initialize Winsock
     StartSockets();
+
+    // Opt-in DLL-search override (Win10+): if RUBY_DLL_PATH is set, register
+    // it (plus ruby.exe's own directory) as a "user dir" with the loader and
+    // switch the process-wide default search to User-Dirs mode. This lets
+    // dln.c's LoadLibraryExW resolve transitive DLL imports from the named
+    // directory directly, skipping the legacy PATH walk.
+    //
+    // Without RUBY_DLL_PATH we stay on the legacy behavior so existing
+    // ruby installations that rely on PATH for native-ext deps keep
+    // working unchanged.
+    g_w32_use_user_dll_dirs = 0;
+    {
+        WCHAR *extra = _wgetenv(L"RUBY_DLL_PATH");
+        if (extra && *extra) {
+            WCHAR exe[MAX_PATH];
+            DWORD exelen = GetModuleFileNameW(NULL, exe, MAX_PATH);
+            if (exelen && exelen < MAX_PATH) {
+                for (DWORD i = exelen; i > 0; --i) {
+                    if (exe[i-1] == L'\\' || exe[i-1] == L'/') {
+                        exe[i-1] = L'\0';
+                        AddDllDirectory(exe);
+                        break;
+                    }
+                }
+            }
+            AddDllDirectory(extra);
+            SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+            g_w32_use_user_dll_dirs = 1;
+        }
+    }
 }
 
 char *

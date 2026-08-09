@@ -361,13 +361,21 @@ dln_open(const char *file)
         dln_memerror();
     }
 
-    /* Load file. LoadLibraryExW with LOAD_WITH_ALTERED_SEARCH_PATH makes the
-     * Windows loader search the .so's OWN directory first when resolving its
-     * transitive DLL imports (gems that bundle their DLLs alongside the .so
-     * get picked up without walking PATH). Note: per MSDN this flag is
-     * mutually exclusive with the LOAD_LIBRARY_SEARCH_* family — combining
-     * them yields ERROR_INVALID_PARAMETER. */
-    handle = LoadLibraryExW(winfile, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    /* Load file. Two modes depending on whether rb_w32_sysinit opted into
+     * AddDllDirectory-based search (controlled by RUBY_DLL_PATH env var):
+     *   - User-Dirs mode: LOAD_LIBRARY_SEARCH_DEFAULT_DIRS searches only
+     *     the registered AddDllDirectory paths + System32 + app dir,
+     *     skipping the legacy PATH walk entirely. LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+     *     also lets .so deps live next to the .so. Mutually exclusive with
+     *     LOAD_WITH_ALTERED_SEARCH_PATH.
+     *   - Default mode: LOAD_WITH_ALTERED_SEARCH_PATH gives modernized
+     *     LoadLibraryW semantics — the .so's own dir is searched first,
+     *     PATH walking still happens after. Safer for arbitrary installs. */
+    extern int g_w32_use_user_dll_dirs;
+    DWORD load_flags = g_w32_use_user_dll_dirs
+        ? (LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR)
+        : LOAD_WITH_ALTERED_SEARCH_PATH;
+    handle = LoadLibraryExW(winfile, NULL, load_flags);
     free(winfile);
 
     if (!handle) {
