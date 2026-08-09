@@ -16,7 +16,10 @@ pub const EC: Opnd = _EC;
 pub const CFP: Opnd = _CFP;
 pub const SP: Opnd = _SP;
 
+#[cfg(not(windows))]
 pub const C_ARG_OPNDS: [Opnd; 6] = _C_ARG_OPNDS;
+#[cfg(windows)]
+pub const C_ARG_OPNDS: [Opnd; 4] = _C_ARG_OPNDS;
 pub const C_RET_OPND: Opnd = _C_RET_OPND;
 pub use crate::backend::current::{Reg, C_RET_REG};
 
@@ -1089,7 +1092,10 @@ impl Assembler
 
     /// Get the list of registers that can be used for stack temps.
     pub fn get_temp_regs() -> &'static [Reg] {
-        let num_regs = get_option!(num_temp_regs);
+        // Clamp to the platform's TEMP_REGS length: Windows x64 has fewer
+        // (RSI/RDI are used as allocation registers there), while the default
+        // num_temp_regs option is sized for the SysV set.
+        let num_regs = get_option!(num_temp_regs).min(TEMP_REGS.len());
         &TEMP_REGS[0..num_regs]
     }
 

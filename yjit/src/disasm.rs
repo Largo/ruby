@@ -146,13 +146,13 @@ pub fn dump_disasm_addr_range(cb: &CodeBlock, start_addr: CodePtr, end_addr: Cod
             match dump_disasm {
                 DumpDisasm::Stdout => println!("{disasm}"),
                 DumpDisasm::File(fd) => {
-                    use std::os::unix::io::{FromRawFd, IntoRawFd};
                     use std::io::Write;
+                    use crate::options::{file_from_raw_ref, file_into_raw_ref};
 
                     // Write with the fd opened during boot
-                    let mut file = unsafe { std::fs::File::from_raw_fd(*fd) };
+                    let mut file = unsafe { file_from_raw_ref(*fd) };
                     file.write_all(disasm.as_bytes()).unwrap();
-                    let _ = file.into_raw_fd(); // keep the fd open
+                    let _ = file_into_raw_ref(file); // keep the fd open
                 }
             };
         }
@@ -338,7 +338,7 @@ pub extern "C" fn rb_yjit_insns_compiled(_ec: EcPtr, _ruby_self: VALUE, iseqw: V
     let insn_vec = insns_compiled(iseq);
 
     unsafe {
-        let insn_ary = rb_ary_new_capa((insn_vec.len() * 2) as i64);
+        let insn_ary = rb_ary_new_capa((insn_vec.len() * 2) as _);
 
         // For each instruction compiled
         for idx in 0..insn_vec.len() {
@@ -350,10 +350,10 @@ pub extern "C" fn rb_yjit_insns_compiled(_ec: EcPtr, _ruby_self: VALUE, iseqw: V
             // Store the instruction index and opcode symbol
             rb_ary_store(
                 insn_ary,
-                (2 * idx + 0) as i64,
+                (2 * idx + 0) as _,
                 VALUE::fixnum_from_usize(insn_idx as usize),
             );
-            rb_ary_store(insn_ary, (2 * idx + 1) as i64, op_sym);
+            rb_ary_store(insn_ary, (2 * idx + 1) as _, op_sym);
         }
 
         insn_ary
