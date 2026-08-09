@@ -9,6 +9,15 @@
 #define DT_REG (S_IFREG>>12)
 #define DT_LNK 10
 
+/* MinGW's headers don't define IFTODT, and dir.c's EMULATE_IFTODT fallback
+ * discards the d_type our readdir emulation computes from the FindFirstFile
+ * attributes — forcing Dir.glob to stat() every entry it visits. The DT_*
+ * values above are exactly (mode >> 12), so defining IFTODT the same way
+ * turns the d_type fast path on with identical semantics. */
+#ifndef IFTODT
+# define IFTODT(m) (((m) & S_IFMT) >> 12)
+#endif
+
 struct direct
 {
     long d_namlen;
