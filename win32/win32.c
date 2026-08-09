@@ -100,6 +100,7 @@ static volatile LONG g_w32_stat_cache_next = 0;
 static volatile LONG g_w32_stat_cache_hits = 0;
 static volatile LONG g_w32_stat_cache_total = 0;
 static int g_w32_stat_cache_enabled = 1; /* turned off by RUBY_W32_STAT_NOCACHE */
+__attribute__((unused))
 static int w32_stat_cache_get(const WCHAR *path, struct stati128 *out, BOOL lstat) {
     if (!g_w32_stat_cache_enabled || !path) return 0;
     InterlockedIncrement(&g_w32_stat_cache_total);
@@ -114,6 +115,7 @@ static int w32_stat_cache_get(const WCHAR *path, struct stati128 *out, BOOL lsta
     }
     return 0;
 }
+__attribute__((unused))
 static void w32_stat_cache_put(const WCHAR *path, const struct stati128 *st,
                                 int returned, BOOL lstat) {
     if (!g_w32_stat_cache_enabled || !path) return;
@@ -919,6 +921,75 @@ static int w32_cmdvector(const WCHAR *, char ***, UINT, rb_encoding *);
  * is active. Read by dln.c to choose LoadLibraryExW flags. */
 int g_w32_use_user_dll_dirs = 0;
 
+/* Background page-cache warmer for RUBY_DLL_PREFETCH. Runs on its own
+ * thread (launched from rb_w32_sysinit). Maps each .dll in `arg` (a
+ * malloc'd directory path, freed here) read-only and calls
+ * PrefetchVirtualMemory so the kernel pages the bytes in asynchronously. */
+static DWORD WINAPI
+w32_prefetch_dll_dir(LPVOID arg)
+{
+    WCHAR *dir = (WCHAR *)arg;
+    int dlen = lstrlenW(dir);
+    WCHAR pattern[MAX_PATH + 32];
+    if (dlen + 6 >= (int)(sizeof(pattern) / sizeof(WCHAR))) { free(dir); return 0; }
+
+    /* dir + "\\*.dll" */
+    memcpy(pattern, dir, dlen * sizeof(WCHAR));
+    pattern[dlen]   = L'\\';
+    pattern[dlen+1] = L'*';
+    pattern[dlen+2] = L'.';
+    pattern[dlen+3] = L'd';
+    pattern[dlen+4] = L'l';
+    pattern[dlen+5] = L'l';
+    pattern[dlen+6] = L'\0';
+
+    typedef struct { PVOID VirtualAddress; SIZE_T NumberOfBytes; } rb_mem_range;
+    typedef BOOL (WINAPI *pfn_pvm)(HANDLE, ULONG_PTR, rb_mem_range *, ULONG);
+    pfn_pvm pPrefetch = NULL;
+    HMODULE k = GetModuleHandleW(L"kernel32.dll");
+    if (k) pPrefetch = (pfn_pvm)GetProcAddress(k, "PrefetchVirtualMemory");
+
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileExW(pattern, FindExInfoBasic, &fd,
+                                   FindExSearchNameMatch, NULL,
+                                   FIND_FIRST_EX_LARGE_FETCH);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            WCHAR fullpath[MAX_PATH + 64];
+            int nlen = lstrlenW(fd.cFileName);
+            if (dlen + 1 + nlen >= (int)(sizeof(fullpath) / sizeof(WCHAR))) continue;
+            memcpy(fullpath, dir, dlen * sizeof(WCHAR));
+            fullpath[dlen] = L'\\';
+            memcpy(&fullpath[dlen + 1], fd.cFileName, (nlen + 1) * sizeof(WCHAR));
+
+            HANDLE f = CreateFileW(fullpath, GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   NULL, OPEN_EXISTING,
+                                   FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+            if (f == INVALID_HANDLE_VALUE) continue;
+            HANDLE mapping = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
+            if (mapping) {
+                void *view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+                if (view) {
+                    if (pPrefetch) {
+                        rb_mem_range entry;
+                        entry.VirtualAddress = view;
+                        entry.NumberOfBytes = (SIZE_T)(((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow);
+                        pPrefetch(GetCurrentProcess(), 1, &entry, 0);
+                    }
+                    UnmapViewOfFile(view);
+                }
+                CloseHandle(mapping);
+            }
+            CloseHandle(f);
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+    }
+    free(dir);
+    return 0;
+}
+
 void
 rb_w32_sysinit(int *argc, char ***argv)
 {
@@ -980,6 +1051,26 @@ rb_w32_sysinit(int *argc, char ***argv)
             AddDllDirectory(extra);
             SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
             g_w32_use_user_dll_dirs = 1;
+        }
+    }
+
+    /* Optional: if RUBY_DLL_PREFETCH names a directory, spawn a detached
+     * background thread that warms the OS page cache for every .dll there.
+     * Running it off-thread means the warm-cache common case pays nothing
+     * on the require path (an earlier inline version added ~24 ms because
+     * it re-mapped already-cached DLLs synchronously). On a cold cache the
+     * kernel reads the DLL bytes in parallel with Ruby's own startup /
+     * parsing, so by the time `require` triggers LoadLibrary the pages are
+     * resident. Pure best-effort — failures are silently ignored. */
+    {
+        WCHAR *prefetch = _wgetenv(L"RUBY_DLL_PREFETCH");
+        if (prefetch && *prefetch) {
+            WCHAR *dup = _wcsdup(prefetch);
+            if (dup) {
+                HANDLE th = CreateThread(NULL, 0, w32_prefetch_dll_dir, dup, 0, NULL);
+                if (th) CloseHandle(th); /* detach; thread frees dup */
+                else free(dup);
+            }
         }
     }
 }
