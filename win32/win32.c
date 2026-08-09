@@ -73,6 +73,22 @@ static int w32_wopen(const WCHAR *file, int oflag, int perm);
 static int w32_stati128(const char *path, struct stati128 *st, UINT cp, BOOL lstat);
 static char *w32_getenv(const char *name, UINT cp);
 
+/* ---- wide-coverage instrumentation counters (file-scope, used across
+ * many functions and printed by winnt_stat_print_stats below). External
+ * linkage (no `static`) so win32/file.c can update g_w32_count_load_ok. */
+volatile LONG g_w32_count_mbstr_to_wstr = 0;
+volatile LONG g_w32_count_wstr_to_mbstr = 0;
+volatile LONG g_w32_count_w32_wopen     = 0;
+volatile LONG g_w32_count_rb_w32_read   = 0;
+volatile LONG g_w32_count_uopendir      = 0;
+volatile LONG g_w32_count_readdir       = 0;
+volatile LONG g_w32_count_w32_access    = 0;
+volatile LONG g_w32_count_realpath      = 0;
+volatile LONG g_w32_count_load_ok       = 0;
+volatile LONG g_w32_count_find_first    = 0;
+volatile LONG g_w32_count_get_file_attr = 0;
+volatile LONG g_w32_count_open_special  = 0;
+
 #undef getenv
 /*
  * Do not remove the macros to substitute functions in dln_find.c.
@@ -2037,6 +2053,7 @@ open_dir_handle(const WCHAR *filename, WIN32_FIND_DATAW *fd)
     //     larger batches from the filesystem, fewer FindNextFile round
     //     trips during readdir iteration.
     //
+    InterlockedIncrement(&g_w32_count_find_first);
     fh = FindFirstFileExW(fullname, FindExInfoBasic, fd,
                           FindExSearchNameMatch, NULL,
                           FIND_FIRST_EX_LARGE_FETCH);
@@ -2156,10 +2173,20 @@ filecp(void)
 char *
 rb_w32_wstr_to_mbstr(UINT cp, const WCHAR *wstr, int clen, long *plen)
 {
+    InterlockedIncrement(&g_w32_count_wstr_to_mbstr);
     char *ptr;
-    int len = WideCharToMultiByte(cp, 0, wstr, clen, NULL, 0, NULL, NULL);
-    if (!(ptr = malloc(len))) return 0;
-    WideCharToMultiByte(cp, 0, wstr, clen, ptr, len, NULL, NULL);
+    /* Conservative upper bound: each UTF-16 WCHAR encodes to at most 4 UTF-8
+     * bytes (the maximum for any cp here). Skip the NULL-output sizing call
+     * and allocate the upper bound directly. */
+    int wlen = (clen < 0) ? ((int)wcslen(wstr) + 1) : clen;
+    int upper = wlen * 4;
+    if (upper < 1) upper = 1;
+    if (!(ptr = malloc(upper))) return 0;
+    int len = WideCharToMultiByte(cp, 0, wstr, clen, ptr, upper, NULL, NULL);
+    if (len == 0) {
+        free(ptr);
+        return 0;
+    }
     if (plen) {
         /* exclude NUL only if NUL-terminated string */
         if (clen == -1) --len;
@@ -2172,10 +2199,23 @@ rb_w32_wstr_to_mbstr(UINT cp, const WCHAR *wstr, int clen, long *plen)
 WCHAR *
 rb_w32_mbstr_to_wstr(UINT cp, const char *str, int clen, long *plen)
 {
+    InterlockedIncrement(&g_w32_count_mbstr_to_wstr);
     WCHAR *ptr;
-    int len = MultiByteToWideChar(cp, 0, str, clen, NULL, 0);
-    if (!(ptr = malloc(sizeof(WCHAR) * len))) return 0;
-    MultiByteToWideChar(cp, 0, str, clen, ptr, len);
+    /* Conservative upper bound: for UTF-8 (the by-far common cp here) and
+     * for legacy code pages, the WCHAR output count is at most the input
+     * byte count. Allocate that up-front and skip the NULL-output sizing
+     * MultiByteToWideChar call (saves ~0.3-0.5us per call; called ~7600
+     * times during `require "gtk3"`). Some bytes of slack at the end is
+     * cheap — the buffer is freed shortly anyway. */
+    int upper = (clen < 0) ? ((int)strlen(str) + 1) : clen;
+    /* Ensure room for a NUL when clen == -1 (input was NUL-terminated). */
+    if (clen < 0 && upper < 1) upper = 1;
+    if (!(ptr = malloc(sizeof(WCHAR) * upper))) return 0;
+    int len = MultiByteToWideChar(cp, 0, str, clen, ptr, upper);
+    if (len == 0) {
+        free(ptr);
+        return 0;
+    }
     if (plen) {
         /* exclude NUL only if NUL-terminated string */
         if (clen == -1) --len;
@@ -2201,6 +2241,7 @@ rb_w32_opendir(const char *filename)
 DIR *
 rb_w32_uopendir(const char *filename)
 {
+    InterlockedIncrement(&g_w32_count_uopendir);
     DIR *ret;
     WCHAR *wpath = utf8_to_wstr(filename, NULL);
     if (!wpath)
@@ -2357,6 +2398,7 @@ readdir_internal(DIR *dirp, BOOL (*conv)(const WCHAR *, const WCHAR *, struct di
 struct direct  *
 rb_w32_readdir(DIR *dirp, rb_encoding *enc)
 {
+    InterlockedIncrement(&g_w32_count_readdir);
     int idx = rb_enc_to_index(enc);
     if (idx == ENCINDEX_ASCII_8BIT) {
         const UINT cp = filecp();
@@ -5792,6 +5834,7 @@ stat_by_find(const WCHAR *path, struct stati128 *st)
     /* Fall back to FindFirstFile for ERROR_SHARING_VIOLATION. Use the
      * Ex variant with FindExInfoBasic (Win7+) to skip the 8.3 short-name
      * lookup — single-shot stat doesn't need the alternate name. */
+    InterlockedIncrement(&g_w32_count_find_first);
     h = FindFirstFileExW(path, FindExInfoBasic, &wfd,
                          FindExSearchNameMatch, NULL, 0);
     if (h == INVALID_HANDLE_VALUE) {
@@ -5829,12 +5872,25 @@ static volatile LONG g_winnt_stat_fast_404 = 0;
 static volatile LONG g_winnt_stat_slow     = 0;
 static volatile LONG g_winnt_stat_byname   = 0;
 static volatile LONG g_winnt_stat_atexit_armed = 0;
+/* The wider counters live at file-scope earlier; this section
+ * just shows them as a group with the print fn. */
+
 static void winnt_stat_print_stats(void) {
     fprintf(stderr,
             "[win32 stat] total=%ld  by_name=%ld  fast_ok=%ld  fast_404=%ld  slow=%ld\n",
             (long)g_winnt_stat_total, (long)g_winnt_stat_byname,
             (long)g_winnt_stat_fast_ok, (long)g_winnt_stat_fast_404,
             (long)g_winnt_stat_slow);
+    fprintf(stderr,
+            "[win32 hot]  mbstr_to_wstr=%ld  wstr_to_mbstr=%ld  w32_wopen=%ld  rb_w32_read=%ld\n"
+            "             uopendir=%ld  readdir=%ld  w32_access=%ld  realpath=%ld\n"
+            "             load_ok=%ld  find_first=%ld  get_file_attr=%ld  open_special=%ld\n",
+            (long)g_w32_count_mbstr_to_wstr, (long)g_w32_count_wstr_to_mbstr,
+            (long)g_w32_count_w32_wopen, (long)g_w32_count_rb_w32_read,
+            (long)g_w32_count_uopendir, (long)g_w32_count_readdir,
+            (long)g_w32_count_w32_access, (long)g_w32_count_realpath,
+            (long)g_w32_count_load_ok, (long)g_w32_count_find_first,
+            (long)g_w32_count_get_file_attr, (long)g_w32_count_open_special);
 }
 
 /* ---- GetFileInformationByName: single-syscall path-based stat
@@ -6165,6 +6221,7 @@ rb_w32_stati128(const char *path, struct stati128 *st)
 char *
 rb_w32_realpath(const char *path)
 {
+    InterlockedIncrement(&g_w32_count_realpath);
     WCHAR *wpath = NULL;
     WCHAR *buf = NULL;
     HANDLE h = INVALID_HANDLE_VALUE;
@@ -6275,6 +6332,7 @@ rb_w32_lseek(int fd, rb_off_t ofs, int whence)
 static int
 w32_access(const char *path, int mode, UINT cp)
 {
+    InterlockedIncrement(&g_w32_count_w32_access);
     struct stati128 stat;
     if (w32_stati128(path, &stat, cp, FALSE) != 0)
         return -1;
@@ -6681,6 +6739,7 @@ rb_w32_wopen(const WCHAR *file, int oflag, ...)
 static int
 w32_wopen(const WCHAR *file, int oflag, int pmode)
 {
+    InterlockedIncrement(&g_w32_count_w32_wopen);
     char flags = 0;
     int fd;
     DWORD access;
@@ -7705,7 +7764,10 @@ rb_w32_write_internal(int fd, const void *buf, size_t size, rb_off_t *offset)
 }
 
 ssize_t
-rb_w32_read(int fd, void *buf, size_t size)
+rb_w32_read_traced(int fd, void *buf, size_t size);
+ssize_t rb_w32_read(int fd, void *buf, size_t size) { InterlockedIncrement(&g_w32_count_rb_w32_read); return rb_w32_read_traced(fd, buf, size); }
+ssize_t
+rb_w32_read_traced(int fd, void *buf, size_t size)
 {
     return rb_w32_read_internal(fd, buf, size, NULL);
 }

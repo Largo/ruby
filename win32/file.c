@@ -581,9 +581,12 @@ rb_file_expand_path_internal(VALUE fname, VALUE dname, int abs_mode, int long_na
     return result;
 }
 
+extern volatile long g_w32_count_load_ok;
+
 int
 rb_file_load_ok(const char *path)
 {
+    InterlockedIncrement(&g_w32_count_load_ok);
     DWORD attr;
     int ret = 1;
     long len;
