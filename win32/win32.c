@@ -5775,10 +5775,170 @@ path_drive(const WCHAR *path)
     return _getdrive() - 1;
 }
 
+/* ---- instrumentation: count winnt_stat outcomes for profiling ---- */
+static volatile LONG g_winnt_stat_total    = 0;
+static volatile LONG g_winnt_stat_fast_ok  = 0;
+static volatile LONG g_winnt_stat_fast_404 = 0;
+static volatile LONG g_winnt_stat_slow     = 0;
+static volatile LONG g_winnt_stat_byname   = 0;
+static volatile LONG g_winnt_stat_atexit_armed = 0;
+static void winnt_stat_print_stats(void) {
+    fprintf(stderr,
+            "[win32 stat] total=%ld  by_name=%ld  fast_ok=%ld  fast_404=%ld  slow=%ld\n",
+            (long)g_winnt_stat_total, (long)g_winnt_stat_byname,
+            (long)g_winnt_stat_fast_ok, (long)g_winnt_stat_fast_404,
+            (long)g_winnt_stat_slow);
+}
+
+/* ---- GetFileInformationByName: single-syscall path-based stat
+ * (kernel32.dll on Windows 11 24H2 / Server 2025 and later). Returns more
+ * info than GetFileAttributesExW (including FileId and NumberOfLinks) in one
+ * call, so we can drop the st_ino=0 / st_nlink=1 compromise from the
+ * GetFileAttributesExW fast path on systems that have it.
+ *
+ * We dynamic-load via GetProcAddress so older Windows 10 hosts still link
+ * and fall through to the GetFileAttributesExW path. */
+typedef struct rb_FILE_STAT_INFORMATION {
+    LARGE_INTEGER FileId;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER AllocationSize;
+    LARGE_INTEGER EndOfFile;
+    ULONG         FileAttributes;
+    ULONG         ReparseTag;
+    ULONG         NumberOfLinks;
+    ACCESS_MASK   EffectiveAccess;
+} rb_FILE_STAT_INFORMATION;
+#define rb_FileStatByNameInfo 0
+typedef BOOL (WINAPI *rb_GetFileInformationByName_t)(
+    PCWSTR, int, PVOID, ULONG);
+static rb_GetFileInformationByName_t pGetFileInformationByName = NULL;
+static volatile LONG g_winnt_stat_apis_init = 0;
+static void winnt_stat_init_apis(void) {
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (k32) {
+        pGetFileInformationByName = (rb_GetFileInformationByName_t)
+            GetProcAddress(k32, "GetFileInformationByName");
+    }
+}
+
 /* License: Ruby's */
 static int
 winnt_stat(const WCHAR *path, struct stati128 *st, BOOL lstat)
 {
+    InterlockedIncrement(&g_winnt_stat_total);
+    if (InterlockedCompareExchange(&g_winnt_stat_atexit_armed, 1, 0) == 0) {
+        atexit(winnt_stat_print_stats);
+        winnt_stat_init_apis();
+    }
+
+    /* ---- Win11 24H2+ super fast path ----
+     * GetFileInformationByName returns FILE_STAT_INFORMATION (file id,
+     * 4 timestamps, sizes, attributes, reparse tag, num links, effective
+     * access) in a SINGLE syscall, with no Win32-layer path canonicalization
+     * overhead. Available since Windows 11 24H2 / Server 2025. */
+    if (pGetFileInformationByName) {
+        rb_FILE_STAT_INFORMATION info;
+        if (pGetFileInformationByName(path, rb_FileStatByNameInfo,
+                                      &info, sizeof(info))) {
+            DWORD attr = info.FileAttributes;
+            if (!(attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                memset(st, 0, sizeof(*st));
+                st->st_size = info.EndOfFile.QuadPart;
+                st->st_atime = filetime_to_unixtime((FILETIME *)&info.LastAccessTime);
+                st->st_atimensec = filetime_to_nsec((FILETIME *)&info.LastAccessTime);
+                st->st_mtime = filetime_to_unixtime((FILETIME *)&info.LastWriteTime);
+                st->st_mtimensec = filetime_to_nsec((FILETIME *)&info.LastWriteTime);
+                st->st_ctime = filetime_to_unixtime((FILETIME *)&info.CreationTime);
+                st->st_ctimensec = filetime_to_nsec((FILETIME *)&info.CreationTime);
+                st->st_nlink = info.NumberOfLinks;
+                st->st_ino = info.FileId.QuadPart;
+                st->st_inohigh = 0;
+                if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+                    if (check_valid_dir(path)) return -1;
+                }
+                st->st_mode = fileattr_to_unixmode(attr, path, 0);
+                st->st_dev = st->st_rdev = path_drive(path);
+                InterlockedIncrement(&g_winnt_stat_byname);
+                return 0;
+            }
+            /* reparse — fall through to slow path which inspects tags */
+        }
+        else {
+            DWORD e = GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_INVALID_NAME ||
+                e == ERROR_PATH_NOT_FOUND || e == ERROR_BAD_NETPATH) {
+                errno = map_errno(e);
+                InterlockedIncrement(&g_winnt_stat_fast_404);
+                return -1;
+            }
+            /* unexpected error — fall through to GetFileAttributesExW */
+        }
+    }
+
+    /* ---- Fast path for the common case ----
+     *
+     * `require` and any LOAD_PATH search calls stat()/File.exist? thousands
+     * of times per startup. The original slow path below does
+     *   CreateFile + GetFileInformationByHandle + GetFileType +
+     *   get_handle_pathname + CloseHandle
+     * for every existing file. GetFileAttributesExW returns size, three
+     * FILETIMEs and dwFileAttributes in a SINGLE syscall without opening
+     * the file — which is what we need for the vast majority of stat()
+     * callers (regular files / directories).
+     *
+     * The slow path is preserved for the case where it actually matters:
+     *   - the path is a reparse point (symlink / AF_UNIX socket / IO_REPARSE_*)
+     *     where the slow path already does the right thing (tag inspection,
+     *     symlink resolution). For lstat with a regular file/dir, the
+     *     "link-itself" attrs are the same as the file's attrs anyway, so the
+     *     fast path is safe.
+     *
+     * st_ino / st_nlink are populated as 0 / 1, mirroring `stat_by_find`
+     * (the existing FindFirstFileW fallback), so the semantic compromise
+     * already exists in the codebase. */
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) {
+            DWORD attr = fad.dwFileAttributes;
+            if (!(attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                memset(st, 0, sizeof(*st));
+                st->st_size = ((__int64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+                st->st_atime = filetime_to_unixtime(&fad.ftLastAccessTime);
+                st->st_atimensec = filetime_to_nsec(&fad.ftLastAccessTime);
+                st->st_mtime = filetime_to_unixtime(&fad.ftLastWriteTime);
+                st->st_mtimensec = filetime_to_nsec(&fad.ftLastWriteTime);
+                st->st_ctime = filetime_to_unixtime(&fad.ftCreationTime);
+                st->st_ctimensec = filetime_to_nsec(&fad.ftCreationTime);
+                st->st_nlink = 1;
+                if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+                    if (check_valid_dir(path)) return -1;
+                }
+                st->st_mode = fileattr_to_unixmode(attr, path, 0);
+                st->st_dev = st->st_rdev = path_drive(path);
+                InterlockedIncrement(&g_winnt_stat_fast_ok);
+                return 0;
+            }
+            /* fall through to slow path: reparse point needs tag inspection */
+        }
+        else {
+            DWORD e = GetLastError();
+            /* Fast-fail on the common "not there" answers; for other errors
+             * (e.g. ERROR_SHARING_VIOLATION, ERROR_ACCESS_DENIED) fall
+             * through so the slow path / stat_by_find can retry. */
+            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_INVALID_NAME ||
+                e == ERROR_PATH_NOT_FOUND || e == ERROR_BAD_NETPATH) {
+                errno = map_errno(e);
+                InterlockedIncrement(&g_winnt_stat_fast_404);
+                return -1;
+            }
+        }
+    }
+    InterlockedIncrement(&g_winnt_stat_slow);
+    /* ---- end fast path ---- */
+
     DWORD flags = lstat ? FILE_FLAG_OPEN_REPARSE_POINT : 0;
     HANDLE f;
     WCHAR *finalname = 0;
@@ -5939,6 +6099,89 @@ int
 rb_w32_stati128(const char *path, struct stati128 *st)
 {
     return w32_stati128(path, st, filecp(), FALSE);
+}
+
+/* ---- rb_w32_realpath: GetFinalPathNameByHandleW-based canonicalization ----
+ *
+ * Ruby's file.c `realpath_rec` walks the input path component-by-component,
+ * calling stat() on each part and following symlinks manually. On Windows
+ * that's many syscalls per realpath() call (every $LOADED_FEATURES insertion
+ * during `require` triggers one). GetFinalPathNameByHandleW returns the
+ * canonical path of a kernel-resolved file handle in a single call — so the
+ * cost reduces to: CreateFileW + GetFinalPathNameByHandleW + CloseHandle.
+ *
+ * Returns a malloc-allocated UTF-8 string (caller frees) on success, or NULL
+ * on failure (file doesn't exist, access denied, etc. — caller then falls
+ * back to the slow walker).  Only handles absolute paths with a drive letter
+ * — relative-path resolution is left to the slow walker since it must apply
+ * basedir / Dir.pwd semantics. */
+char *
+rb_w32_realpath(const char *path)
+{
+    WCHAR *wpath = NULL;
+    WCHAR *buf = NULL;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    DWORD len, len2;
+    char *result = NULL;
+    WCHAR *out;
+
+    if (!path) return NULL;
+    /* Only accept absolute paths with drive letter ("X:\..." or "X:/...").
+     * Relative paths and UNC paths take the slow walker. */
+    if (!((path[0] && path[1] == ':') &&
+          (path[2] == '\\' || path[2] == '/')))
+        return NULL;
+
+    if (!(wpath = mbstr_to_wstr(CP_UTF8, path, -1, NULL))) return NULL;
+
+    h = CreateFileW(wpath, 0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING,
+                    /* BACKUP_SEMANTICS so directories also open */
+                    FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(wpath);
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = map_errno(GetLastError());
+        return NULL;
+    }
+
+    len = GetFinalPathNameByHandleW(h, NULL, 0, FILE_NAME_NORMALIZED);
+    if (len == 0) {
+        errno = map_errno(GetLastError());
+        CloseHandle(h);
+        return NULL;
+    }
+
+    buf = (WCHAR *)malloc(sizeof(WCHAR) * (len + 1));
+    if (!buf) { CloseHandle(h); return NULL; }
+
+    len2 = GetFinalPathNameByHandleW(h, buf, len, FILE_NAME_NORMALIZED);
+    CloseHandle(h);
+    if (len2 == 0 || len2 >= len) {
+        free(buf);
+        return NULL;
+    }
+
+    /* GetFinalPathNameByHandleW returns paths prefixed with the NT namespace
+     * indicator "\\?\" (or "\\?\UNC\" for shares). Strip "\\?\" for drive
+     * letter paths so callers see the familiar "C:\foo\bar" form. */
+    out = buf;
+    if (len2 > 4 && wcsncmp(buf, L"\\\\?\\", 4) == 0) {
+        /* leave "\\?\UNC\..." alone — those are network paths */
+        if (!(len2 > 8 && wcsncmp(buf + 4, L"UNC\\", 4) == 0)) {
+            out = buf + 4;
+        }
+    }
+
+    /* Ruby on Windows canonicalizes paths with forward slashes ($LOADED_FEATURES
+     * compares strings literally — a "C:\foo\bar.rb" canonical here would not
+     * match a "C:/foo/bar.rb" added earlier and the file would load twice).
+     * Normalize "\" to "/" in place. */
+    for (WCHAR *q = out; *q; ++q) if (*q == L'\\') *q = L'/';
+
+    result = wstr_to_mbstr(CP_UTF8, out, -1, NULL);
+    free(buf);
+    return result;
 }
 
 /* License: Ruby's */
