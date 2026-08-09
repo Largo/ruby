@@ -7300,19 +7300,30 @@ fn get_array_len(asm: &mut Assembler, array_opnd: Opnd) -> Opnd {
     let emb_len_opnd = asm.and(flags_opnd, (RARRAY_EMBED_LEN_MASK as u64).into());
     let emb_len_opnd = asm.rshift(emb_len_opnd, (RARRAY_EMBED_LEN_SHIFT as u64).into());
 
-    // Conditionally move the length of the heap array
-    let flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
-    asm.test(flags_opnd, (RARRAY_EMBED_FLAG as u64).into());
-
     let array_reg = match array_opnd {
         Opnd::InsnOut { .. } => array_opnd,
         _ => asm.load(array_opnd),
     };
-    let array_len_opnd = Opnd::mem(
-        std::os::raw::c_long::BITS as u8,
-        array_reg,
-        RUBY_OFFSET_RARRAY_AS_HEAP_LEN,
-    );
+    let long_bits = std::os::raw::c_long::BITS as u8;
+    // On LLP64 (Windows) `long` is 32-bit, so the heap length field is narrower
+    // than VALUE. Read a full VALUE-width word (the 4 bytes above `len` belong
+    // to the adjacent aux field) and mask to the low `long` bits. Array lengths
+    // are non-negative, so this zero-extends the length to a 64-bit operand that
+    // matches the embedded length for the csel and for downstream Fixnum
+    // tagging. On LP64 `long` is already VALUE-width, so read it directly.
+    //
+    // NOTE: this masking `and` clobbers the flags, so it must run BEFORE the
+    // `test` below whose result the csel consumes.
+    let array_len_opnd = if long_bits < VALUE_BITS {
+        let raw = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RARRAY_AS_HEAP_LEN);
+        asm.and(raw, ((1u64 << long_bits) - 1).into())
+    } else {
+        Opnd::mem(long_bits, array_reg, RUBY_OFFSET_RARRAY_AS_HEAP_LEN)
+    };
+
+    // Conditionally move the length of the heap array
+    let flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
+    asm.test(flags_opnd, (RARRAY_EMBED_FLAG as u64).into());
 
     // Select the array length value
     asm.csel_nz(emb_len_opnd, array_len_opnd)
