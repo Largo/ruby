@@ -7844,7 +7844,12 @@ fn gen_send_iseq(
     if let (None, Some(builtin_info), true, false, None | Some(0)) =
            (block, builtin_func, builtin_attrs & BUILTIN_ATTR_LEAF != 0, opt_send_call, splat_array_length) {
         let builtin_argc = unsafe { (*builtin_info).argc };
-        if builtin_argc + 1 < (C_ARG_OPNDS.len() as i32) {
+        // Windows x64 has only 4 argument registers, but ccall() spills further
+        // arguments onto the stack (MS x64 ABI), so builtins can take the same
+        // arity as the 6-register SysV ABI instead of side-exiting early. Using
+        // the SysV register count as the limit keeps parity across platforms.
+        let arg_reg_limit: i32 = if cfg!(windows) { 6 } else { C_ARG_OPNDS.len() as i32 };
+        if builtin_argc + 1 < arg_reg_limit {
             // We pop the block arg without using it because:
             //  - the builtin is leaf, so it promises to not `yield`.
             //  - no leaf builtins have block param at the time of writing, and
@@ -10784,8 +10789,11 @@ fn gen_invokebuiltin(
     let bf: *const rb_builtin_function = jit.get_arg(0).as_ptr();
     let bf_argc: usize = unsafe { (*bf).argc }.try_into().expect("non negative argc");
 
-    // ec, self, and arguments
-    if bf_argc + 2 > C_ARG_OPNDS.len() {
+    // ec, self, and arguments. Windows x64 has 4 argument registers, but
+    // ccall() spills further arguments onto the stack, so allow the same
+    // arity as the 6-register SysV ABI instead of side-exiting early.
+    let arg_reg_limit = if cfg!(windows) { 6 } else { C_ARG_OPNDS.len() };
+    if bf_argc + 2 > arg_reg_limit {
         incr_counter!(invokebuiltin_too_many_args);
         return None;
     }
@@ -10823,8 +10831,10 @@ fn gen_opt_invokebuiltin_delegate(
     let bf_argc = unsafe { (*bf).argc };
     let start_index = jit.get_arg(1).as_i32();
 
-    // ec, self, and arguments
-    if bf_argc + 2 > (C_ARG_OPNDS.len() as i32) {
+    // ec, self, and arguments. See gen_invokebuiltin: on Windows ccall()
+    // spills args beyond the 4 registers, so match the SysV arity limit.
+    let arg_reg_limit = if cfg!(windows) { 6 } else { C_ARG_OPNDS.len() as i32 };
+    if bf_argc + 2 > arg_reg_limit {
         incr_counter!(invokebuiltin_too_many_args);
         return None;
     }
