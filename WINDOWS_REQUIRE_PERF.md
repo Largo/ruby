@@ -13,18 +13,30 @@ runs 2-5 (after OS file cache warm-up).
 
 | Library | Upstream Ruby 4.0.5 (DevKit, no patches) | HEAD + this stack | Speedup |
 |--------------|---------:|---------:|--------:|
-| `gtk3`             | 2434 ms | **1755 ms** | **1.39×** |
+| `gtk3`             | 2434 ms | **1721 ms** | **1.41×** |
 | `concurrent-ruby`  |  301 ms | **111 ms**  | **2.71×** |
-| `tzinfo`           |  ~150 ms | ~145 ms     | ~1.03×  |
+| `tzinfo`           |  ~150 ms | **~139 ms** | **~1.08×** |
 | `sqlite3`          |  ~45 ms | ~45 ms      | ~1.00×  |
 
-`gtk3` saves ~679 ms (28%) end-to-end. `concurrent-ruby` saves ~190 ms (63%).
-Pre-existing fast pure-Ruby and small-native cases (`tzinfo`, `sqlite3`) are
-unchanged — they were never stat- or GC-bound.
+`gtk3` saves ~713 ms (29%) end-to-end. `concurrent-ruby` saves ~190 ms (63%).
+`tzinfo` picks up ~6 ms from the latest rb_file_load_ok change. `sqlite3`
+is already fast (mostly LoadLibrary-bound).
 
-## The 5 commits
+## The 6 commits
 
 In `git log --oneline` order (newest first; all on top of upstream `master`).
+
+### 0. `f6025b5ab5 win32/file: skip redundant CreateFile in rb_file_load_ok for regular files`
+
+`rb_file_load_ok` is called for every `$LOAD_PATH` candidate that exists during
+`require`. It did `GetFileAttributesW` (cheap) followed by `CreateFileW` +
+`CloseHandle` (~50 µs, two extra syscalls) to verify ACL readability. For 99%
+of candidates (regular `.rb` / `.so` files on normal NTFS) the attribute check
+is enough — denied-access paths fail noisily at the subsequent load step
+anyway. The CreateFile fallback is preserved for reparse points so dangling
+symlinks still report "not loadable".
+
+Result: gtk3 require -34 ms (-1.9%), tzinfo -6 ms (-4.1%).
 
 ### 1. `eb0f7b0d32 win32: stat fast paths`
 
