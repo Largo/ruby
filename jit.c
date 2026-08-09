@@ -811,6 +811,15 @@ rb_jit_mark_executable(void *mem_block, uint32_t mem_size)
         return;
     }
 #ifdef _WIN32
+    // The page-aligned range can contain reserved pages beyond the portion
+    // made writable, or pages decommitted by code GC. Commit the whole range
+    // before changing its protection; VirtualProtect rejects a range that
+    // contains even one uncommitted page.
+    if (VirtualAlloc(mem_block, mem_size, MEM_COMMIT, PAGE_READWRITE) == NULL) {
+        rb_bug("Couldn't commit JIT page (%p, %lu bytes), error: %lu",
+            mem_block, (unsigned long)mem_size, (unsigned long)GetLastError());
+    }
+
     DWORD old_protect;
     if (!VirtualProtect(mem_block, mem_size, PAGE_EXECUTE_READ, &old_protect)) {
         rb_bug("Couldn't make JIT page (%p, %lu bytes) executable, error: %lu",
