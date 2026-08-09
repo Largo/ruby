@@ -1749,6 +1749,26 @@ fn gen_adjuststack(
     Some(KeepCompiling)
 }
 
+/// On LLP64 targets (Windows x64), `long` is 32-bit so Ruby's Fixnum range is
+/// `LONG_MAX/2` (±2^30) and a valid tagged Fixnum VALUE fits in signed 32 bits.
+/// YJIT's integer fast paths do 64-bit arithmetic and only detect overflow at
+/// 2^63, so a result between 2^31 and 2^63 would stay Fixnum-tagged when it
+/// should be a Bignum ("unnormalized Fixnum"). Side-exit to the interpreter
+/// (which promotes to Bignum) when the tagged result leaves the 32-bit range.
+/// No-op on LP64, where the 64-bit overflow check already matches the boundary.
+#[inline]
+fn guard_fixnum_in_long_range(asm: &mut Assembler, tagged: Opnd, counter: Counter) {
+    if !cfg!(windows) {
+        return;
+    }
+    // Valid tagged Fixnum range on LLP64: [ (LONG_MIN/2)<<1|1 , (LONG_MAX/2)<<1|1 ]
+    // = [ -2147483647 , 2147483647 ], i.e. it must fit in signed 32 bits.
+    asm.cmp(tagged, Opnd::Imm(0x7FFF_FFFF));
+    asm.jg(Target::side_exit(counter));
+    asm.cmp(tagged, Opnd::Imm(-0x7FFF_FFFF));
+    asm.jl(Target::side_exit(counter));
+}
+
 fn gen_opt_plus(
     jit: &mut JITState,
     asm: &mut Assembler,
@@ -1776,6 +1796,12 @@ fn gen_opt_plus(
         let arg0_untag = asm.sub(arg0, Opnd::Imm(1));
         let out_val = asm.add(arg0_untag, arg1);
         asm.jo(Target::side_exit(Counter::opt_plus_overflow));
+        // LLP64 (Windows): Fixnum is `long`-wide (RUBY_FIXNUM_MAX = LONG_MAX/2,
+        // and long is 32-bit) even though VALUE is 64-bit, so the 64-bit `jo`
+        // above only catches overflow at 2^63. A valid tagged fixnum fits in
+        // signed 32 bits; side-exit (promote to Bignum in the interpreter)
+        // when the result leaves that range.
+        guard_fixnum_in_long_range(asm, out_val, Counter::opt_plus_overflow);
 
         // Push the output on the stack
         let dst = asm.stack_push(Type::Fixnum);
@@ -4085,6 +4111,9 @@ fn gen_opt_minus(
         let val_untag = asm.sub(arg0, arg1);
         asm.jo(Target::side_exit(Counter::opt_minus_overflow));
         let val = asm.add(val_untag, Opnd::Imm(1));
+        // LLP64 (Windows): see gen_opt_plus. Side-exit when the tagged result
+        // leaves the signed-32-bit `long` fixnum range.
+        guard_fixnum_in_long_range(asm, val, Counter::opt_minus_overflow);
 
         // Push the output on the stack
         let dst = asm.stack_push(Type::Fixnum);
@@ -4128,6 +4157,9 @@ fn gen_opt_mult(
         let out_val = asm.mul(arg0_untag, arg1_untag);
         jit_chain_guard(JCC_JO_MUL, jit, asm, 1, Counter::opt_mult_overflow);
         let out_val = asm.add(out_val, Opnd::UImm(1));
+        // LLP64 (Windows): see gen_opt_plus. The 64-bit multiply overflow check
+        // misses the 31-bit `long` fixnum boundary.
+        guard_fixnum_in_long_range(asm, out_val, Counter::opt_mult_overflow);
 
         // Push the output on the stack
         let dst = asm.stack_push(Type::Fixnum);
@@ -5441,6 +5473,8 @@ fn jit_rb_int_succ(
     asm_comment!(asm, "Integer#succ");
     let out_val = asm.add(recv, Opnd::Imm(2)); // 2 is untagged Fixnum 1
     asm.jo(Target::side_exit(Counter::opt_succ_overflow));
+    // LLP64 (Windows): see gen_opt_plus.
+    guard_fixnum_in_long_range(asm, out_val, Counter::opt_succ_overflow);
 
     // Push the output onto the stack
     let dst = asm.stack_push(Type::Fixnum);

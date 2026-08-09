@@ -113,6 +113,10 @@ pub use autogened::*;
 // Use bindgen for functions that are defined in headers or in yjit.c.
 #[cfg_attr(test, allow(unused))] // We don't link against C code when testing
 extern "C" {
+    // Fixnum-or-Bignum from a 64-bit unsigned. Used by num_from_usize to pack
+    // counter values that overflow the (LLP64) Fixnum range.
+    pub fn rb_ull2inum(n: std::os::raw::c_ulonglong) -> VALUE;
+
     pub fn rb_check_overloaded_cme(
         me: *const rb_callable_method_entry_t,
         ci: *const rb_callinfo,
@@ -542,6 +546,19 @@ impl VALUE {
         assert!(item <= (RUBY_FIXNUM_MAX as usize)); // An unsigned will always be greater than RUBY_FIXNUM_MIN
         let k: usize = item.wrapping_add(item.wrapping_add(1));
         VALUE(k)
+    }
+
+    /// Convert a `usize` to a Ruby Integer, promoting to a Bignum when it
+    /// exceeds the Fixnum range. On LLP64 (Windows) the Fixnum range is only
+    /// ±2^30 (RUBY_FIXNUM_MAX = LONG_MAX/2, long is 32-bit), so counter values
+    /// (e.g. RubyVM::YJIT.runtime_stats) routinely overflow a Fixnum, where
+    /// `fixnum_from_usize` would assert. This is the safe converter.
+    pub fn num_from_usize(item: usize) -> Self {
+        if item <= (RUBY_FIXNUM_MAX as usize) {
+            Self::fixnum_from_usize(item)
+        } else {
+            unsafe { rb_ull2inum(item as std::os::raw::c_ulonglong) }
+        }
     }
 }
 
