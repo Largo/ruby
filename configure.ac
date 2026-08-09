@@ -3929,11 +3929,17 @@ AS_IF([test "$cross_compiling" = no],
         ],
         [arm64-*bsd*|aarch64-*bsd*|x86_64-*bsd*], [
             JIT_TARGET_OK=yes
-        ],
-        [x86_64-*mingw*], [
-            dnl experimental: MS x64 ABI support in the YJIT x86_64 backend
-            JIT_TARGET_OK=yes
         ]
+    )
+)
+
+dnl YJIT additionally supports the native Microsoft x64 ABI on MinGW.
+dnl Keep this separate from JIT_TARGET_OK so this does not implicitly enable
+dnl the experimental ZJIT on a platform it has not enabled itself.
+YJIT_TARGET_OK=$JIT_TARGET_OK
+AS_IF([test "$cross_compiling" = no],
+    AS_CASE(["$target_cpu-$target_os"],
+        [x86_64-*mingw*], [YJIT_TARGET_OK=yes]
     )
 )
 
@@ -3942,7 +3948,7 @@ AC_ARG_ENABLE(yjit,
     AS_HELP_STRING([--enable-yjit],
     [enable in-process JIT compiler that requires Rust build tools. enabled by default on supported platforms if rustc 1.58.0+ is available]),
     [YJIT_SUPPORT=$enableval],
-    [AS_CASE(["$JIT_TARGET_OK:$JIT_RUSTC_OK"],
+    [AS_CASE(["$YJIT_TARGET_OK:$JIT_RUSTC_OK"],
         [yes:yes], [
             YJIT_SUPPORT=yes
         ],
