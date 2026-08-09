@@ -2027,9 +2027,19 @@ open_dir_handle(const WCHAR *filename, WIN32_FIND_DATAW *fd)
     *++p = L'\0';
 
     //
-    // do the FindFirstFile call
+    // do the FindFirstFile call. Use FindFirstFileExW with:
+    //   - FindExInfoBasic (Win7+): skip the 8.3 short-name lookup, which is
+    //     a noticeable per-entry cost on volumes where short names are
+    //     generated. cAlternateFileName comes back as an empty string; the
+    //     caller already handles that (alt name was already optional on
+    //     volumes with 8.3 generation disabled).
+    //   - FIND_FIRST_EX_LARGE_FETCH (Win7+): pull directory entries in
+    //     larger batches from the filesystem, fewer FindNextFile round
+    //     trips during readdir iteration.
     //
-    fh = FindFirstFileW(fullname, fd);
+    fh = FindFirstFileExW(fullname, FindExInfoBasic, fd,
+                          FindExSearchNameMatch, NULL,
+                          FIND_FIRST_EX_LARGE_FETCH);
     if (fh == INVALID_HANDLE_VALUE) {
         errno = map_errno(GetLastError());
     }
@@ -5779,8 +5789,11 @@ stat_by_find(const WCHAR *path, struct stati128 *st)
     HANDLE h;
     WIN32_FIND_DATAW wfd;
 
-    /* Fall back to FindFirstFile for ERROR_SHARING_VIOLATION */
-    h = FindFirstFileW(path, &wfd);
+    /* Fall back to FindFirstFile for ERROR_SHARING_VIOLATION. Use the
+     * Ex variant with FindExInfoBasic (Win7+) to skip the 8.3 short-name
+     * lookup — single-shot stat doesn't need the alternate name. */
+    h = FindFirstFileExW(path, FindExInfoBasic, &wfd,
+                         FindExSearchNameMatch, NULL, 0);
     if (h == INVALID_HANDLE_VALUE) {
         errno = map_errno(GetLastError());
         return -1;
