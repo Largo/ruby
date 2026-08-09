@@ -6117,6 +6117,93 @@ rb_w32_stati128(const char *path, struct stati128 *st)
 }
 
 /* License: Ruby's */
+/* Canonicalize an absolute drive-letter path with a single
+ * CreateFileW + GetFinalPathNameByHandleW pair, instead of the generic
+ * realpath_rec() walker that stats every path component.
+ * Returns a malloc'ed UTF-8 string, or NULL to fall back to the walker. */
+char *
+rb_w32_realpath(const char *path)
+{
+    /* Stack buffers for both conversions: realpath runs once per file added
+     * to $LOADED_FEATURES, and typical paths fit comfortably. This also
+     * saves the sizing call of GetFinalPathNameByHandleW. Long paths fall
+     * back to the heap. */
+    WCHAR wbuf[PATH_MAX + 8];
+    WCHAR outstack[PATH_MAX + 8];
+    WCHAR *wpath = wbuf;
+    WCHAR *buf = NULL;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    DWORD len2;
+    char *result = NULL;
+    WCHAR *out;
+
+    if (!path) return NULL;
+    /* Only accept absolute paths with drive letter ("X:\..." or "X:/...").
+     * Relative paths and UNC paths take the slow walker. */
+    if (!((path[0] && path[1] == ':') &&
+          (path[2] == '\\' || path[2] == '/')))
+        return NULL;
+
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wbuf, numberof(wbuf))) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) return NULL;
+        if (!(wpath = mbstr_to_wstr(CP_UTF8, path, -1, NULL))) return NULL;
+    }
+
+    h = CreateFileW(wpath, 0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING,
+                    /* BACKUP_SEMANTICS so directories also open */
+                    FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (wpath != wbuf) free(wpath);
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = map_errno(GetLastError());
+        return NULL;
+    }
+
+    out = outstack;
+    len2 = GetFinalPathNameByHandleW(h, outstack, numberof(outstack), FILE_NAME_NORMALIZED);
+    if (len2 == 0) {
+        errno = map_errno(GetLastError());
+        CloseHandle(h);
+        return NULL;
+    }
+    if (len2 >= numberof(outstack)) {
+        /* Buffer too small: len2 is the required size incl. the NUL. */
+        DWORD need = len2 + 1;
+        buf = (WCHAR *)malloc(sizeof(WCHAR) * need);
+        if (!buf) { CloseHandle(h); return NULL; }
+        len2 = GetFinalPathNameByHandleW(h, buf, need, FILE_NAME_NORMALIZED);
+        if (len2 == 0 || len2 >= need) {
+            free(buf);
+            CloseHandle(h);
+            return NULL;
+        }
+        out = buf;
+    }
+    CloseHandle(h);
+
+    /* GetFinalPathNameByHandleW returns paths prefixed with the NT namespace
+     * indicator "\\?\" (or "\\?\UNC\" for shares). Strip "\\?\" for drive
+     * letter paths so callers see the familiar "C:\foo\bar" form. */
+    if (len2 > 4 && wcsncmp(out, L"\\\\?\\", 4) == 0) {
+        /* leave "\\?\UNC\..." alone - those are network paths */
+        if (!(len2 > 8 && wcsncmp(out + 4, L"UNC\\", 4) == 0)) {
+            out += 4;
+        }
+    }
+
+    /* Ruby on Windows canonicalizes paths with forward slashes ($LOADED_FEATURES
+     * compares strings literally - a "C:\foo\bar.rb" canonical here would not
+     * match a "C:/foo/bar.rb" added earlier and the file would load twice).
+     * Normalize "\" to "/" in place. */
+    for (WCHAR *q = out; *q; ++q) if (*q == L'\\') *q = L'/';
+
+    result = wstr_to_mbstr(CP_UTF8, out, -1, NULL);
+    free(buf);
+    return result;
+}
+
+/* License: Ruby's */
 static int
 w32_stati128(const char *path, struct stati128 *st, UINT cp, BOOL lstat)
 {
