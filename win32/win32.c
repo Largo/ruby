@@ -6120,13 +6120,22 @@ rb_w32_stati128(const char *path, struct stati128 *st)
 static int
 w32_stati128(const char *path, struct stati128 *st, UINT cp, BOOL lstat)
 {
-    WCHAR *wpath;
+    /* Stat runs thousands of times per `require`; paths are almost always
+     * < PATH_MAX, so convert into a stack buffer and skip the per-call
+     * malloc/free. Oversized or invalid paths fall back to the heap path. */
+    WCHAR wbuf[PATH_MAX + 8];
+    WCHAR *wpath = wbuf;
     int ret;
 
-    if (!(wpath = mbstr_to_wstr(cp, path, -1, NULL)))
-        return -1;
+    if (!MultiByteToWideChar(cp, 0, path, -1, wbuf, numberof(wbuf))) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+            return -1;
+        if (!(wpath = mbstr_to_wstr(cp, path, -1, NULL)))
+            return -1;
+    }
     ret = wstati128(wpath, st, lstat);
-    free(wpath);
+    if (wpath != wbuf)
+        free(wpath);
     return ret;
 }
 
