@@ -2897,7 +2897,7 @@ fn gen_get_ivar(
         // The function could raise RactorIsolationError.
         jit_prepare_non_leaf_call(jit, asm);
 
-        let ivar_val = asm.ccall(rb_ivar_get as *const u8, vec![recv, Opnd::UImm(ivar_name)]);
+        let ivar_val = asm.ccall(rb_ivar_get as *const u8, vec![recv, Opnd::UImm(ivar_name as _)]);
 
         if recv_opnd != SelfOpnd {
             asm.stack_pop(1);
@@ -2977,7 +2977,7 @@ fn gen_get_ivar(
                 } else {
                     // The function could raise RactorIsolationError.
                     jit_prepare_non_leaf_call(jit, asm);
-                    asm.ccall(rb_ivar_get_at as *const u8, vec![recv, Opnd::UImm((ivar_index as u32).into()), Opnd::UImm(ivar_name)])
+                    asm.ccall(rb_ivar_get_at as *const u8, vec![recv, Opnd::UImm((ivar_index as u32).into()), Opnd::UImm(ivar_name as _)])
                 }
             };
 
@@ -3013,7 +3013,7 @@ fn gen_getinstancevariable(
         asm,
         GET_IVAR_MAX_DEPTH,
         comptime_val,
-        ivar_name,
+        ivar_name as _,
         self_asm_opnd,
         SelfOpnd,
     )
@@ -3071,7 +3071,7 @@ fn gen_setinstancevariable(
         jit,
         asm,
         comptime_receiver,
-        ivar_name,
+        ivar_name as _,
         SelfOpnd,
         Some(ic),
     )
@@ -3172,7 +3172,7 @@ fn gen_set_ivar(
                 rb_vm_set_ivar_id as *const u8,
                 vec![
                     recv,
-                    Opnd::UImm(ivar_name),
+                    Opnd::UImm(ivar_name as _),
                     val_opnd,
                 ],
             );
@@ -3400,8 +3400,8 @@ fn gen_definedivar(
 
     let shape_id = comptime_receiver.shape_id_of();
     let ivar_exists = unsafe {
-        let mut ivar_index: u16 = 0;
-        rb_shape_get_iv_index(shape_id, ivar_name, &mut ivar_index)
+        let mut ivar_index: attr_index_t = 0;
+        rb_shape_get_iv_index(shape_id, ivar_name as _, &mut ivar_index)
     };
 
     // Guard heap object (recv_opnd must be used before stack_pop)
@@ -4328,7 +4328,7 @@ fn gen_opt_duparray_send(
 ) -> Option<CodegenStatus> {
     let method = jit.get_arg(1).as_u64();
 
-    if method == ID!(include_p) {
+    if method == ID!(include_p) as u64 {
         gen_opt_duparray_send_include_p(jit, asm)
     } else {
         None
@@ -6734,7 +6734,7 @@ fn c_method_tracing_currently_enabled(jit: &JITState) -> bool {
 unsafe extern "C" fn build_kwhash(ci: *const rb_callinfo, sp: *const VALUE) -> VALUE {
     let kw_arg = vm_ci_kwarg(ci);
     let kw_len: usize = get_cikw_keyword_len(kw_arg).try_into().unwrap();
-    let hash = rb_hash_new_with_size(kw_len as u64);
+    let hash = rb_hash_new_with_size(kw_len as _);
 
     for kwarg_idx in 0..kw_len {
         let key = get_cikw_keywords_idx(kw_arg, kwarg_idx.try_into().unwrap());
@@ -8528,7 +8528,7 @@ fn gen_iseq_kw_call(
 
                 // Use the total number of supplied keywords as a size upper bound
                 let keyword_len = unsafe { (*keywords).keyword_len } as usize;
-                let hash = unsafe { rb_hash_new_with_size(keyword_len as u64) };
+                let hash = unsafe { rb_hash_new_with_size(keyword_len as _) };
 
                 // Put pairs into the kwrest hash as the mask describes
                 for kwarg_idx in 0..keyword_len {
@@ -8903,7 +8903,7 @@ fn gen_struct_aref(
 
     // Confidence checks
     assert!(unsafe { RB_TYPE_P(comptime_recv, RUBY_T_STRUCT) });
-    assert!((off as i64) < unsafe { RSTRUCT_LEN(comptime_recv) });
+    assert!((off as i64) < i64::from(unsafe { RSTRUCT_LEN(comptime_recv) }));
 
     // We are going to use an encoding that takes a 4-byte immediate which
     // limits the offset to INT32_MAX.
@@ -8981,7 +8981,7 @@ fn gen_struct_aset(
 
     // Confidence checks
     assert!(unsafe { RB_TYPE_P(comptime_recv, RUBY_T_STRUCT) });
-    assert!((off as i64) < unsafe { RSTRUCT_LEN(comptime_recv) });
+    assert!((off as i64) < i64::from(unsafe { RSTRUCT_LEN(comptime_recv) }));
 
     asm_comment!(asm, "struct aset");
 
@@ -9243,7 +9243,7 @@ fn gen_send_general(
                     asm,
                     SEND_MAX_DEPTH,
                     comptime_recv,
-                    ivar_name,
+                    ivar_name as _,
                     recv,
                     recv.into(),
                 );
@@ -9490,7 +9490,7 @@ fn get_class_name(class: Option<VALUE>) -> String {
 }
 
 /// Assemble "{class_name}#{method_name}" from a class pointer and a method ID
-fn get_method_name(class: Option<VALUE>, mid: u64) -> String {
+fn get_method_name(class: Option<VALUE>, mid: ID) -> String {
     let class_name = get_class_name(class);
     let method_name = if mid != 0 {
         unsafe { cstr_to_rust_string(rb_id2name(mid)) }

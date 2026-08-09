@@ -3929,6 +3929,10 @@ AS_IF([test "$cross_compiling" = no],
         ],
         [arm64-*bsd*|aarch64-*bsd*|x86_64-*bsd*], [
             JIT_TARGET_OK=yes
+        ],
+        [x86_64-*mingw*], [
+            dnl experimental: MS x64 ABI support in the YJIT x86_64 backend
+            JIT_TARGET_OK=yes
         ]
     )
 )
@@ -4005,6 +4009,10 @@ AS_CASE(["${YJIT_SUPPORT}"],
         AC_DEFINE_UNQUOTED(YJIT_SUPPORT, [$YJIT_SUPPORT])
     ])
     AC_DEFINE(USE_YJIT, 1)
+    AS_CASE(["$target_os"], [mingw*], [
+        dnl system libraries the Rust standard library (staticlib) pulls in
+        LIBS="$LIBS -lbcrypt -lntdll -luserenv -lsynchronization"
+    ])
 ], [
     AC_DEFINE(USE_YJIT, 0)
 ])

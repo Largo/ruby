@@ -17,11 +17,23 @@ pub const _EC: Opnd = Opnd::Reg(R12_REG);
 pub const _SP: Opnd = Opnd::Reg(RBX_REG);
 
 // C argument registers on this platform
+#[cfg(not(windows))]
 pub const _C_ARG_OPNDS: [Opnd; 6] = [
     Opnd::Reg(RDI_REG),
     Opnd::Reg(RSI_REG),
     Opnd::Reg(RDX_REG),
     Opnd::Reg(RCX_REG),
+    Opnd::Reg(R8_REG),
+    Opnd::Reg(R9_REG)
+];
+
+// Windows x64: only four register arguments (RCX, RDX, R8, R9); further
+// arguments are passed on the native stack above the 32-byte shadow space.
+// See the CCall handling in x86_split/x86_emit.
+#[cfg(windows)]
+pub const _C_ARG_OPNDS: [Opnd; 4] = [
+    Opnd::Reg(RCX_REG),
+    Opnd::Reg(RDX_REG),
     Opnd::Reg(R8_REG),
     Opnd::Reg(R9_REG)
 ];
@@ -80,7 +92,19 @@ impl From<&Opnd> for X86Opnd {
 }
 
 /// List of registers that can be used for stack temps and locals.
+/// On Windows x64, RSI/RDI are callee-saved and are instead used as
+/// allocation registers (see get_alloc_regs) — they are preserved once per
+/// JIT frame in FrameSetup. RCX/RDX must stay out of the alloc set because
+/// gen_branch_stub places call arguments directly in them, so the temp/alloc
+/// split differs from SysV.
+#[cfg(not(windows))]
 pub static TEMP_REGS: [Reg; 5] = [RSI_REG, RDI_REG, R8_REG, R9_REG, R10_REG];
+// Windows x64: all five are caller-saved (spilled around ccalls). RCX/RDX
+// double as the first two C argument registers, exactly as R8/R9 do in the
+// SysV set, so gen_branch_stub can place args in them. RSI/RDI are excluded
+// here because they are the allocation registers (get_alloc_regs).
+#[cfg(windows)]
+pub static TEMP_REGS: [Reg; 5] = [RCX_REG, RDX_REG, R8_REG, R9_REG, R10_REG];
 
 impl Assembler
 {
@@ -91,6 +115,7 @@ impl Assembler
 
 
     /// Get the list of registers from which we can allocate on this platform
+    #[cfg(not(windows))]
     pub fn get_alloc_regs() -> Vec<Reg>
     {
         vec![
@@ -100,9 +125,29 @@ impl Assembler
         ]
     }
 
+    /// Windows x64: RCX and RDX are argument registers that gen_branch_stub
+    /// and friends write to directly, so they must not be allocatable. Use
+    /// RSI/RDI instead (callee-saved, preserved once per frame in FrameSetup).
+    #[cfg(windows)]
+    pub fn get_alloc_regs() -> Vec<Reg>
+    {
+        vec![
+            RAX_REG,
+            RSI_REG,
+            RDI_REG,
+        ]
+    }
+
     /// Get a list of all of the caller-save registers
+    #[cfg(not(windows))]
     pub fn get_caller_save_regs() -> Vec<Reg> {
         vec![RAX_REG, RCX_REG, RDX_REG, RSI_REG, RDI_REG, R8_REG, R9_REG, R10_REG, R11_REG]
+    }
+
+    /// Windows x64 caller-saved GP registers (RSI/RDI are callee-saved there).
+    #[cfg(windows)]
+    pub fn get_caller_save_regs() -> Vec<Reg> {
+        vec![RAX_REG, RCX_REG, RDX_REG, R8_REG, R9_REG, R10_REG, R11_REG]
     }
 
     // These are the callee-saved registers in the x86-64 SysV ABI
@@ -365,17 +410,43 @@ impl Assembler
                     asm.not(opnd0);
                 },
                 Insn::CCall { opnds, fptr, .. } => {
-                    assert!(opnds.len() <= C_ARG_OPNDS.len());
+                    // On SysV all supported arities fit in registers. On
+                    // Windows x64 only the first four arguments do; the rest
+                    // are pushed onto the native stack (in reverse, padded to
+                    // an even count to keep 16-byte alignment at the call).
+                    // The CCall emission adds the 32-byte shadow space, which
+                    // lands exactly between the return address and these
+                    // pushed arguments.
+                    let num_reg_args = C_ARG_OPNDS.len().min(opnds.len());
+                    let num_stack_args = opnds.len() - num_reg_args;
+                    let num_pushed = (num_stack_args + 1) & !1;
 
-                    // Load each operand into the corresponding argument
-                    // register.
-                    for (idx, opnd) in opnds.into_iter().enumerate() {
+                    if num_stack_args > 0 {
+                        if num_stack_args % 2 == 1 {
+                            // alignment padding slot
+                            asm.cpush(Opnd::Reg(Assembler::SCRATCH_REG));
+                        }
+                        for opnd in opnds[num_reg_args..].iter().rev() {
+                            let val = match opnd {
+                                Opnd::Reg(_) => *opnd,
+                                _ => asm.load(*opnd),
+                            };
+                            asm.cpush(val);
+                        }
+                    }
+
+                    // Load each remaining operand into the corresponding
+                    // argument register.
+                    for (idx, opnd) in opnds[..num_reg_args].iter().enumerate() {
                         asm.load_into(Opnd::c_arg(C_ARG_OPNDS[idx]), *opnd);
                     }
 
-                    // Now we push the CCall without any arguments so that it
-                    // just performs the call.
-                    asm.ccall(*fptr, vec![]);
+                    // Now we push the CCall with only inert register operands
+                    // marking how many stack slots were pushed — the emission
+                    // uses opnds.len() to size the post-call stack cleanup
+                    // (and this insn must stay last so the iterator maps the
+                    // call result correctly).
+                    asm.ccall(*fptr, vec![Opnd::Reg(Assembler::SCRATCH_REG); num_pushed]);
                 },
                 Insn::Lea { .. } => {
                     // Merge `lea` and `mov` into a single `lea` when possible
@@ -523,6 +594,15 @@ impl Assembler
                 // Set up RBP to work with frame pointer unwinding
                 // (e.g. with Linux `perf record --call-graph fp`)
                 Insn::FrameSetup => {
+                    // Windows x64: RSI and RDI are callee-saved, but the JIT
+                    // uses them as stack-temp registers (TEMP_REGS), so they
+                    // must be preserved across the JIT entry. Two pushes keep
+                    // the 16-byte stack alignment parity unchanged.
+                    #[cfg(windows)]
+                    {
+                        push(cb, RSI);
+                        push(cb, RDI);
+                    }
                     if get_option!(frame_pointer) {
                         push(cb, RBP);
                         mov(cb, RBP, RSP);
@@ -533,6 +613,11 @@ impl Assembler
                     if get_option!(frame_pointer) {
                         pop(cb, RBP);
                         pop(cb, RBP);
+                    }
+                    #[cfg(windows)]
+                    {
+                        pop(cb, RDI);
+                        pop(cb, RSI);
                     }
                 },
 
@@ -664,8 +749,20 @@ impl Assembler
                 },
 
                 // C function call
+                #[cfg(not(windows))]
                 Insn::CCall { fptr, .. } => {
                     call_ptr(cb, RAX, *fptr);
+                },
+
+                // Windows x64: the caller provides 32 bytes of shadow space
+                // just above the return address. Any pushed stack arguments
+                // (see x86_split; their count travels in opnds) sit directly
+                // above the shadow space, and are dropped together with it.
+                #[cfg(windows)]
+                Insn::CCall { fptr, opnds, .. } => {
+                    sub(cb, RSP, imm_opnd(0x20));
+                    call_ptr(cb, RAX, *fptr);
+                    add(cb, RSP, imm_opnd(0x20 + 8 * opnds.len() as i64));
                 },
 
                 Insn::CRet(opnd) => {

@@ -17,6 +17,12 @@
 #include "internal/fixnum.h"
 #include "internal/string.h"
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#else
+#include <windows.h>
+#endif
+
 enum jit_bindgen_constants {
     // Field offsets for the RObject struct
     ROBJECT_OFFSET_AS_HEAP_FIELDS = offsetof(struct RObject, as.heap.fields),
@@ -607,6 +613,13 @@ rb_jit_get_page_size(void)
     if (page_size > 0x40000000l) rb_bug("jit page size too large");
 
     return (uint32_t)page_size;
+#elif defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    if (si.dwPageSize == 0 || si.dwPageSize > 0x40000000ul) {
+        rb_bug("jit: bad page size");
+    }
+    return (uint32_t)si.dwPageSize;
 #else
 #error "JIT supports POSIX only for now"
 #endif
@@ -714,8 +727,29 @@ rb_jit_reserve_addr_space(uint32_t mem_size)
 
     return mem_block;
 #else
-    // Windows not supported for now
-    return NULL;
+    // Windows: reserve address space with VirtualAlloc; pages are committed
+    // page-by-page later via rb_jit_mark_writable (MEM_COMMIT).
+    uint8_t *mem_block = NULL;
+
+    // Try to reserve close to the ruby image so 32-bit relative call/jmp
+    // encodings can reach C functions. Probe downwards in 4 MiB steps
+    // from our own code address; the allocator falls back to "anywhere".
+    uint8_t *req_addr = (uint8_t *)((uintptr_t)&rb_jit_reserve_addr_space & ~(uintptr_t)0xFFFF);
+    for (int attempt = 0; attempt < 1024; attempt++) {
+        req_addr -= 4 * 1024 * 1024;
+        if (req_addr <= (uint8_t *)0x10000) break;
+        mem_block = VirtualAlloc(req_addr, mem_size, MEM_RESERVE, PAGE_NOACCESS);
+        if (mem_block) break;
+    }
+    if (!mem_block) {
+        mem_block = VirtualAlloc(NULL, mem_size, MEM_RESERVE, PAGE_NOACCESS);
+    }
+    if (!mem_block) {
+        fprintf(stderr, "ruby: jit: VirtualAlloc reserve of %u bytes failed (%lu)\n",
+                mem_size, (unsigned long)GetLastError());
+        exit(EXIT_FAILURE);
+    }
+    return mem_block;
 #endif
 }
 
@@ -730,7 +764,13 @@ rb_jit_for_each_iseq(rb_iseq_callback callback, void *data)
 bool
 rb_jit_mark_writable(void *mem_block, uint32_t mem_size)
 {
+#ifdef _WIN32
+    // The region is only MEM_RESERVEd up-front; committing is what makes
+    // the pages usable (and is idempotent for already-committed pages).
+    return VirtualAlloc(mem_block, mem_size, MEM_COMMIT, PAGE_READWRITE) != NULL;
+#else
     return mprotect(mem_block, mem_size, PROT_READ | PROT_WRITE) == 0;
+#endif
 }
 
 void
@@ -741,16 +781,30 @@ rb_jit_mark_executable(void *mem_block, uint32_t mem_size)
     if (mem_size == 0) {
         return;
     }
+#ifdef _WIN32
+    DWORD old_protect;
+    if (!VirtualProtect(mem_block, mem_size, PAGE_EXECUTE_READ, &old_protect)) {
+        rb_bug("Couldn't make JIT page (%p, %lu bytes) executable, error: %lu",
+            mem_block, (unsigned long)mem_size, (unsigned long)GetLastError());
+    }
+    FlushInstructionCache(GetCurrentProcess(), mem_block, mem_size);
+#else
     if (mprotect(mem_block, mem_size, PROT_READ | PROT_EXEC)) {
         rb_bug("Couldn't make JIT page (%p, %lu bytes) executable, errno: %s",
             mem_block, (unsigned long)mem_size, strerror(errno));
     }
+#endif
 }
 
 // Free the specified memory block.
 bool
 rb_jit_mark_unused(void *mem_block, uint32_t mem_size)
 {
+#ifdef _WIN32
+    // Decommit: the pages return to reserved state; a later
+    // rb_jit_mark_writable (MEM_COMMIT) makes them usable again.
+    return VirtualFree(mem_block, mem_size, MEM_DECOMMIT) != 0;
+#else
     // On Linux, you need to use madvise MADV_DONTNEED to free memory.
     // We might not need to call this on macOS, but it's not really documented.
     // We generally prefer to do the same thing on both to ease testing too.
@@ -759,6 +813,7 @@ rb_jit_mark_unused(void *mem_block, uint32_t mem_size)
     // On macOS, mprotect PROT_NONE seems to reduce RSS.
     // We also call this on Linux to avoid executing unused pages.
     return mprotect(mem_block, mem_size, PROT_NONE) == 0;
+#endif
 }
 
 // Invalidate icache for arm64.
