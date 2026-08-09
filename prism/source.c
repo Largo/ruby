@@ -148,6 +148,32 @@ pm_source_mapped_new(const char *filepath, int open_flags, pm_source_init_result
         return pm_source_alloc(empty_source, 0, PM_SOURCE_CONSTANT);
     }
 
+    /*
+     * On Windows a section map (CreateFileMapping + MapViewOfFile) costs a
+     * kernel section object plus soft page faults on first touch, which for
+     * the small files `require` feeds us is slower than a single ReadFile
+     * into a heap buffer. Read small files directly; keep the map for large
+     * ones. Set PM_WIN32_MMAP=1 to force the old mapping behavior (A/B).
+     */
+    static int pm_w32_use_read = -1;
+    if (pm_w32_use_read == -1) {
+        WCHAR dummy[2];
+        pm_w32_use_read = (GetEnvironmentVariableW(L"PM_WIN32_MMAP", dummy, 2) == 0) ? 1 : 0;
+    }
+    if (pm_w32_use_read && file_size <= (16u * 1024 * 1024)) {
+        uint8_t *source = xmalloc(file_size);
+        if (source != NULL) {
+            DWORD bytes_read;
+            if (ReadFile(handle.file, source, file_size, &bytes_read, NULL) && bytes_read == file_size) {
+                pm_source_file_handle_close(&handle);
+                *result = PM_SOURCE_INIT_SUCCESS;
+                return pm_source_alloc(source, (size_t) file_size, PM_SOURCE_OWNED);
+            }
+            xfree_sized(source, file_size);
+            /* Fall through to the mapping path on a failed read. */
+        }
+    }
+
     /* Create a mapping of the file. */
     HANDLE mapping = CreateFileMapping(handle.file, NULL, PAGE_READONLY, 0, 0, NULL);
     if (mapping == NULL) {
