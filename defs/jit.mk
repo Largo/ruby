@@ -73,6 +73,9 @@ ifneq ($(findstring mingw,$(target_os)),)
 # made relative because the MRI script is not subject to MSYS path conversion.
 LIBRUBY_A_OBJS := $(filter-out $(RUST_LIBOBJ),$(LIBRUBY_A_OBJS))
 LIBRUBY_A_MERGE = $(if $(RUST_LIB),printf 'OPEN %s\nADDLIB %s\nSAVE\nEND\n' '$@' '$(RUST_LIBOBJ:$(TOP_BUILD_DIR)/%=%)' | $(AR) -M,:)
+# Export only Ruby's own symbols from the DLL, not the Rust internals (whose
+# mangled names are not even valid in a .def file).
+RUBYDEF_OBJS = $(LIBRUBY_A_OBJS) $(INITOBJS)
 
 # binutils `ld -r` cannot partial-link the TLS directory the Rust std emits
 # on PE ("unable to fill in DataDirectory[9]: _tls_used not defined
