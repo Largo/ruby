@@ -74,6 +74,9 @@ LIBRUBY_A_MERGE = $(if $(RUST_LIB),printf 'OPEN %s\nADDLIB %s\nSAVE\nEND\n' '$@'
 # Export only Ruby's own symbols from the DLL, not the Rust internals (whose
 # mangled names are not even valid in a .def file).
 RUBYDEF_OBJS = $(LIBRUBY_A_OBJS) $(INITOBJS)
+# The members of the Rust archive cannot be localized on PE (no `ld -r`), so
+# leave them out of the leaked-globals check; the DLL exports are still checked.
+LEAKED_GLOBALS_OBJS = $(filter-out $(RUST_LIBOBJ),$(COMMONOBJS))
 
 # binutils `ld -r` cannot partial-link the TLS directory the Rust std emits
 # on PE ("unable to fill in DataDirectory[9]: _tls_used not defined
