@@ -71,7 +71,8 @@ ifneq ($(findstring mingw,$(target_os)),)
 # hiding everything but rb_* so Rust's bundled compiler_builtins (lgamma_r,
 # etc.) don't collide with Ruby's own missing/*.c. The linker then pulls
 # members from this archive like any other library input.
-RUST_LIBOBJ = $(RUST_LIB:.a=.localized.a)
+# RUST_LIBOBJ is $(RUST_LIB:.a=.localized.a) here (set by configure, so that
+# common.mk sees the same name when it expands the miniruby prerequisites).
 # Unlike the Linux path we cannot `ld -r`-merge the archive first (PE TLS
 # limitation), so we must NOT blanket-localize every non-rb_* symbol -- that
 # would sever the cross-CGU references inside the Rust static lib (fmt impls,
