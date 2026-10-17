@@ -64,6 +64,14 @@ endif # ifneq ($(JIT_CARGO_SUPPORT),no)
 
 RUST_LIB_SYMBOLS = $(RUST_LIB:.a=).symbols
 ifneq ($(findstring mingw,$(target_os)),)
+# RUST_LIBOBJ is an archive here, and an archive nested inside the static
+# libruby is invisible to the linker (mkmf's have_func probes link against
+# it). Keep it out of the ar command line and merge its members instead;
+# ADDLIB copes with the duplicate member names of Rust archives. The path is
+# made relative because the MRI script is not subject to MSYS path conversion.
+LIBRUBY_A_OBJS := $(filter-out $(RUST_LIBOBJ),$(LIBRUBY_A_OBJS))
+LIBRUBY_A_MERGE = $(if $(RUST_LIB),printf 'OPEN %s\nADDLIB %s\nSAVE\nEND\n' '$@' '$(RUST_LIBOBJ:$(TOP_BUILD_DIR)/%=%)' | $(AR) -M,:)
+
 # binutils `ld -r` cannot partial-link the TLS directory the Rust std emits
 # on PE ("unable to fill in DataDirectory[9]: _tls_used not defined
 # correctly"). Instead, make a localized *copy of the archive*: objcopy
