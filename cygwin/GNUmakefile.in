@@ -107,7 +107,7 @@ $(LIBRUBY_SO): $(RUBYDEF)
 
 # defs/jit.mk narrows this so the Rust members of the static library are
 # not exported
-RUBYDEF_OBJS = $(LIBRUBY_A)
+RUBYDEF_OBJS ?= $(LIBRUBY_A)
 $(RUBYDEF): $(LIBRUBY_A) $(PREP) $(BOOTSTRAPRUBY_FAKE) $(RBCONFIG)
 	$(ECHO) generating $@
 	$(Q) $(BOOTSTRAPRUBY_COMMAND) $(srcdir)/win32/mkexports.rb -output=$@ $(RUBYDEF_OBJS)
