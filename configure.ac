@@ -3931,7 +3931,7 @@ AS_IF([test "$RUSTC" != "no"],
     AC_MSG_CHECKING([whether ${RUSTC} works for YJIT])
     AS_CASE(["$target_cpu"],
         [arm64|aarch64], [JIT_TARGET_ARCH=aarch64],
-        [x86_64], [JIT_TARGET_ARCH=x86_64],
+        [x86_64|x64], [JIT_TARGET_ARCH=x86_64],
     )
     dnl Fails in case rustc target doesn't match ruby target.
     dnl Can happen on Rosetta, for example.
@@ -3968,7 +3968,7 @@ dnl the experimental ZJIT on a platform it has not enabled itself.
 YJIT_TARGET_OK=$JIT_TARGET_OK
 AS_IF([test "$cross_compiling" = no],
     AS_CASE(["$target_cpu-$target_os"],
-        [x86_64-*mingw*], [YJIT_TARGET_OK=yes]
+        [x86_64-*mingw*|x64-*mingw*], [YJIT_TARGET_OK=yes]
     )
 )
 
@@ -4147,6 +4147,13 @@ AS_IF([test -n "$RUST_LIB"], [
     # absolute path to stop the "target" dir in src dir from interfering through VPATH
     RUST_LIB='$(TOP_BUILD_DIR)'/"${RUST_LIB}"
 ])
+
+dnl On MinGW the Rust staticlib is linked as a symbol-localized archive copy
+dnl instead of a partially linked object (see defs/jit.mk).
+AS_CASE(["$target_os"],
+    [mingw*], [RUST_LIBOBJ_SUFFIX=.localized.a],
+    [RUST_LIBOBJ_SUFFIX=.$OBJEXT])
+AC_SUBST(RUST_LIBOBJ_SUFFIX)
 
 dnl These variables end up in ::RbConfig::CONFIG
 AC_SUBST(RUSTC)dnl Rust compiler command
