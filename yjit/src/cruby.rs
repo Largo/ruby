@@ -126,6 +126,9 @@ extern "C" {
     // dependent (see yjit.c); use these instead of the bindgen constants.
     pub fn rb_yjit_ec_thread_ptr_offset() -> std::os::raw::c_int;
     pub fn rb_yjit_ec_ractor_id_offset() -> std::os::raw::c_int;
+    // VM clock used for timer interrupts on Windows (see yjit.c), or NULL
+    pub fn rb_yjit_vm_clock_ptr() -> *const u32;
+    pub fn rb_yjit_ec_checked_clock_offset() -> std::os::raw::c_int;
 
     // Floats within range will be encoded without creating objects in the heap.
     // (Range is 0x3000000000000001 to 0x4fffffffffffffff (1.7272337110188893E-77 to 2.3158417847463237E+77).
