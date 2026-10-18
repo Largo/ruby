@@ -5531,6 +5531,7 @@ fn jit_rb_int_pred(
     asm_comment!(asm, "Integer#pred");
     let out_val = asm.sub(recv, Opnd::Imm(2)); // 2 is untagged Fixnum 1
     asm.jo(Target::side_exit(Counter::send_pred_underflow));
+    guard_fixnum_in_long_range(asm, out_val, Counter::send_pred_underflow);
 
     // Push the output onto the stack
     let dst = asm.stack_push(Type::Fixnum);
@@ -5634,6 +5635,7 @@ fn fixnum_left_shift_body(asm: &mut Assembler, lhs: Opnd, shift_amt: u64) {
 
     // Re-tag the output value
     let out_val = asm.add(out_val, 1.into());
+    guard_fixnum_in_long_range(asm, out_val, Counter::lshift_overflow);
 
     let ret_opnd = asm.stack_push(Type::Fixnum);
     asm.mov(ret_opnd, out_val);
@@ -7349,29 +7351,27 @@ fn get_array_len(asm: &mut Assembler, array_opnd: Opnd) -> Opnd {
         Opnd::InsnOut { .. } => array_opnd,
         _ => asm.load(array_opnd),
     };
-    let long_bits = std::os::raw::c_long::BITS as u8;
-    // On LLP64 (Windows) `long` is 32-bit, so the heap length field is narrower
-    // than VALUE. Read a full VALUE-width word (the 4 bytes above `len` belong
-    // to the adjacent aux field) and mask to the low `long` bits. Array lengths
-    // are non-negative, so this zero-extends the length to a 64-bit operand that
-    // matches the embedded length for the csel and for downstream Fixnum
-    // tagging. On LP64 `long` is already VALUE-width, so read it directly.
-    //
-    // NOTE: this masking `and` clobbers the flags, so it must run BEFORE the
-    // `test` below whose result the csel consumes.
-    let array_len_opnd = if long_bits < VALUE_BITS {
-        let raw = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RARRAY_AS_HEAP_LEN);
-        asm.and(raw, ((1u64 << long_bits) - 1).into())
-    } else {
-        Opnd::mem(long_bits, array_reg, RUBY_OFFSET_RARRAY_AS_HEAP_LEN)
-    };
+    // Keep the heap length as a memory operand of the csel: materializing it
+    // in a register first runs out of allocatable registers on Windows.
+    let array_len_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RARRAY_AS_HEAP_LEN);
 
     // Conditionally move the length of the heap array
     let flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
     asm.test(flags_opnd, (RARRAY_EMBED_FLAG as u64).into());
 
     // Select the array length value
-    asm.csel_nz(emb_len_opnd, array_len_opnd)
+    let len = asm.csel_nz(emb_len_opnd, array_len_opnd);
+
+    // On LLP64 (Windows) `long` is 32-bit, so the heap length field is narrower
+    // than VALUE and the word read above has the adjacent field in its upper
+    // half. Lengths are non-negative, so masking to the low `long` bits
+    // zero-extends it (and leaves the small embedded length unchanged).
+    let long_bits = std::os::raw::c_long::BITS as u8;
+    if long_bits < VALUE_BITS {
+        asm.and(len, ((1u64 << long_bits) - 1).into())
+    } else {
+        len
+    }
 }
 
 // Generate RARRAY_CONST_PTR (part of RARRAY_AREF)
