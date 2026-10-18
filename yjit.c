@@ -560,3 +560,17 @@ static VALUE yjit_c_builtin_p(rb_execution_context_t *ec, VALUE self) { return Q
 // Preprocessed yjit.rb generated during build
 #include "yjit.rbinc"
 
+// Fields of rb_execution_context_t that follow the USE_VM_CLOCK field move
+// on platforms that define it (Windows in Ruby 4.0), but the checked-in Rust
+// bindings are generated on Linux. Let the C compiler supply these offsets.
+int
+rb_yjit_ec_thread_ptr_offset(void)
+{
+    return (int)offsetof(rb_execution_context_t, thread_ptr);
+}
+
+int
+rb_yjit_ec_ractor_id_offset(void)
+{
+    return (int)offsetof(rb_execution_context_t, ractor_id);
+}

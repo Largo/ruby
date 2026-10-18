@@ -6745,7 +6745,7 @@ fn jit_thread_s_current(
     asm.stack_pop(1);
 
     // ec->thread_ptr
-    let ec_thread_opnd = asm.load(Opnd::mem(64, EC, RUBY_OFFSET_EC_THREAD_PTR as i32));
+    let ec_thread_opnd = asm.load(Opnd::mem(64, EC, unsafe { rb_yjit_ec_thread_ptr_offset() }));
 
     // thread->self
     let thread_self = Opnd::mem(64, ec_thread_opnd, RUBY_OFFSET_THREAD_SELF);
@@ -7505,7 +7505,7 @@ fn gen_send_bmethod(
     if !procv.shareable_p() {
         let ractor_serial = unsafe { rb_yjit_cme_ractor_serial(cme) };
         asm_comment!(asm, "guard current ractor == {}", ractor_serial);
-        let current_ractor_serial = asm.load(Opnd::mem(64, EC, RUBY_OFFSET_EC_RACTOR_ID as i32));
+        let current_ractor_serial = asm.load(Opnd::mem(64, EC, unsafe { rb_yjit_ec_ractor_id_offset() }));
         asm.cmp(current_ractor_serial, ractor_serial.into());
         asm.jne(Target::side_exit(Counter::send_bmethod_ractor));
     }
