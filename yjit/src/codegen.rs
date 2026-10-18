@@ -1228,6 +1228,18 @@ fn gen_check_ints(
     asm.test(interrupt_flag, interrupt_flag);
 
     asm.jnz(Target::side_exit(counter));
+
+    // With USE_VM_CLOCK the timer thread does not set interrupt_flag; it only
+    // advances vm->clock. Side exit when the clock moved so that the
+    // interpreter's RUBY_VM_CHECK_INTS turns it into a timer interrupt.
+    let vm_clock = unsafe { rb_yjit_vm_clock_ptr() };
+    if !vm_clock.is_null() {
+        let checked_clock_offset = unsafe { rb_yjit_ec_checked_clock_offset() };
+        let vm_clock_ptr = asm.load(Opnd::const_ptr(vm_clock as *const u8));
+        let vm_clock = asm.load(Opnd::mem(32, vm_clock_ptr, 0));
+        asm.cmp(vm_clock, Opnd::mem(32, EC, checked_clock_offset));
+        asm.jne(Target::side_exit(counter));
+    }
 }
 
 // Generate a stubbed unconditional jump to the next bytecode instruction.

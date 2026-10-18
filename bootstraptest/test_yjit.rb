@@ -5577,3 +5577,18 @@ assert_equal '1', %q{
   set_thread_local(1)
   Thread.current[:yjit_thread_local].to_s
 }
+
+# A JIT-compiled loop has to let other threads run. With USE_VM_CLOCK
+# (Windows) the timer only advances vm->clock, which JIT code must check.
+assert_equal 'ok', %q{
+  def spin
+    i = 0
+    while true
+      i += 1
+    end
+  end
+  spin_thread = Thread.new { spin }
+  sleep 0.1
+  spin_thread.kill
+  :ok
+}

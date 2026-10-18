@@ -126,6 +126,9 @@ extern "C" {
     // dependent (see yjit.c); use these instead of the bindgen constants.
     pub fn rb_yjit_ec_thread_ptr_offset() -> std::os::raw::c_int;
     pub fn rb_yjit_ec_ractor_id_offset() -> std::os::raw::c_int;
+    // VM clock used for timer interrupts on Windows (see yjit.c), or NULL
+    pub fn rb_yjit_vm_clock_ptr() -> *const u32;
+    pub fn rb_yjit_ec_checked_clock_offset() -> std::os::raw::c_int;
 
     pub fn rb_jit_iseq_mark_ep_escape_recorded(iseq: IseqPtr);
     pub fn rb_jit_iseq_ep_escape_recorded_p(iseq: IseqPtr) -> bool;
