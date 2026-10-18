@@ -5563,3 +5563,17 @@ assert_equal '42', %q{
   # Resume the fiber; compiled_method's iseq must still be valid
   fiber.resume.to_s
 }
+
+# Thread.current reads ec->thread_ptr, whose offset is platform dependent
+assert_equal 'Thread', %q{
+  def thread_current = Thread.current
+  thread_current
+  thread_current.class.name
+}
+
+assert_equal '1', %q{
+  def set_thread_local(v) = Thread.current[:yjit_thread_local] = v
+  set_thread_local(0)
+  set_thread_local(1)
+  Thread.current[:yjit_thread_local].to_s
+}

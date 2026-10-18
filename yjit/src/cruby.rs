@@ -122,6 +122,11 @@ extern "C" {
         ci: *const rb_callinfo,
     ) -> *const rb_callable_method_entry_t;
 
+    // Offsets of rb_execution_context_t fields whose position is platform
+    // dependent (see yjit.c); use these instead of the bindgen constants.
+    pub fn rb_yjit_ec_thread_ptr_offset() -> std::os::raw::c_int;
+    pub fn rb_yjit_ec_ractor_id_offset() -> std::os::raw::c_int;
+
     pub fn rb_jit_iseq_mark_ep_escape_recorded(iseq: IseqPtr);
     pub fn rb_jit_iseq_ep_escape_recorded_p(iseq: IseqPtr) -> bool;
 
