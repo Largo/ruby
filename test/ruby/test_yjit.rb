@@ -1974,7 +1974,7 @@ class TestYJIT < Test::Unit::TestCase
     # redirect key, and CreateProcess only wires up fds 0/1/2), so the child
     # writes its marshaled results to a temp file whose path we pass via the
     # environment instead of a fd-3 pipe.
-    if Gem.win_platform?
+    if /mswin|mingw/ =~ RUBY_PLATFORM
       require "tempfile"
       stats_file = Tempfile.new("yjit_test_stats")
       stats_file.close
