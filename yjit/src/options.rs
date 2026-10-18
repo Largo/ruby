@@ -137,10 +137,45 @@ pub enum TraceExits {
     Counter(Counter),
 }
 
+/// Raw reference to an output file opened during boot. On unix this is a
+/// RawFd; on Windows we store the raw handle as usize. It is re-wrapped in
+/// a File for each write and immediately released so it stays open.
+#[cfg(unix)]
+pub type RawFileRef = std::os::unix::io::RawFd;
+#[cfg(windows)]
+pub type RawFileRef = usize;
+
+#[cfg(unix)]
+pub fn file_into_raw_ref(file: std::fs::File) -> RawFileRef {
+    use std::os::unix::io::IntoRawFd;
+    file.into_raw_fd()
+}
+
+#[cfg(windows)]
+pub fn file_into_raw_ref(file: std::fs::File) -> RawFileRef {
+    use std::os::windows::io::IntoRawHandle;
+    file.into_raw_handle() as RawFileRef
+}
+
+/// Wrap the raw reference in a File. The caller must release it again with
+/// file_into_raw_ref (or mem::forget) to keep the descriptor open.
+pub unsafe fn file_from_raw_ref(raw: RawFileRef) -> std::fs::File {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::FromRawFd;
+        std::fs::File::from_raw_fd(raw)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{FromRawHandle, RawHandle};
+        std::fs::File::from_raw_handle(raw as RawHandle)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LogOutput {
     // Dump to the log file as events occur.
-    File(std::os::unix::io::RawFd),
+    File(RawFileRef),
     // Keep the log in memory only
     MemoryOnly,
     // Dump to stderr when the process exits
@@ -152,7 +187,7 @@ pub enum DumpDisasm {
     // Dump to stdout
     Stdout,
     // Dump to "yjit_{pid}.log" file under the specified directory
-    File(std::os::unix::io::RawFd),
+    File(RawFileRef),
 }
 
 /// Type of symbols to dump into /tmp/perf-{pid}.map
@@ -304,9 +339,8 @@ pub fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
                     let path = format!("{directory}/yjit_{}.log", std::process::id());
                     match File::options().create(true).append(true).open(&path) {
                         Ok(file) => {
-                            use std::os::unix::io::IntoRawFd;
                             eprintln!("YJIT disasm dump: {path}");
-                            unsafe { OPTIONS.dump_disasm = Some(DumpDisasm::File(file.into_raw_fd())) }
+                            unsafe { OPTIONS.dump_disasm = Some(DumpDisasm::File(file_into_raw_ref(file))) }
                         }
                         Err(err) => eprintln!("Failed to create {path}: {err}"),
                     }
@@ -351,10 +385,9 @@ pub fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
 
                 match File::options().create(true).write(true).truncate(true).open(&log_file_path) {
                     Ok(file) => {
-                        use std::os::unix::io::IntoRawFd;
                         eprintln!("YJIT log: {log_file_path}");
 
-                        unsafe { OPTIONS.log = Some(LogOutput::File(file.into_raw_fd())) }
+                        unsafe { OPTIONS.log = Some(LogOutput::File(file_into_raw_ref(file))) }
                         Log::init()
                     }
                     Err(err) => panic!("Failed to create {log_file_path}: {err}"),

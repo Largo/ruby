@@ -74,14 +74,14 @@ impl Log {
                 }
 
                 LogOutput::File(fd) => {
-                    use std::os::unix::io::{FromRawFd, IntoRawFd};
                     use std::io::Write;
+                    use crate::options::{file_from_raw_ref, file_into_raw_ref};
 
                     // Write with the fd opened during boot
-                    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+                    let mut file = unsafe { file_from_raw_ref(fd) };
                     writeln!(file, "{}", entry).unwrap();
                     file.flush().unwrap();
-                    let _ = file.into_raw_fd(); // keep the fd open
+                    let _ = file_into_raw_ref(file); // keep the fd open
                 }
 
                 LogOutput::MemoryOnly => () // Don't print or write anything

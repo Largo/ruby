@@ -1228,6 +1228,18 @@ fn gen_check_ints(
     asm.test(interrupt_flag, interrupt_flag);
 
     asm.jnz(Target::side_exit(counter));
+
+    // With USE_VM_CLOCK the timer thread does not set interrupt_flag; it only
+    // advances vm->clock. Side exit when the clock moved so that the
+    // interpreter's RUBY_VM_CHECK_INTS turns it into a timer interrupt.
+    let vm_clock = unsafe { rb_yjit_vm_clock_ptr() };
+    if !vm_clock.is_null() {
+        let checked_clock_offset = unsafe { rb_yjit_ec_checked_clock_offset() };
+        let vm_clock_ptr = asm.load(Opnd::const_ptr(vm_clock as *const u8));
+        let vm_clock = asm.load(Opnd::mem(32, vm_clock_ptr, 0));
+        asm.cmp(vm_clock, Opnd::mem(32, EC, checked_clock_offset));
+        asm.jne(Target::side_exit(counter));
+    }
 }
 
 // Generate a stubbed unconditional jump to the next bytecode instruction.
@@ -1749,6 +1761,26 @@ fn gen_adjuststack(
     Some(KeepCompiling)
 }
 
+/// On LLP64 targets (Windows x64), `long` is 32-bit so Ruby's Fixnum range is
+/// `LONG_MAX/2` (±2^30) and a valid tagged Fixnum VALUE fits in signed 32 bits.
+/// YJIT's integer fast paths do 64-bit arithmetic and only detect overflow at
+/// 2^63, so a result between 2^31 and 2^63 would stay Fixnum-tagged when it
+/// should be a Bignum ("unnormalized Fixnum"). Side-exit to the interpreter
+/// (which promotes to Bignum) when the tagged result leaves the 32-bit range.
+/// No-op on LP64, where the 64-bit overflow check already matches the boundary.
+#[inline]
+fn guard_fixnum_in_long_range(asm: &mut Assembler, tagged: Opnd, counter: Counter) {
+    if !cfg!(windows) {
+        return;
+    }
+    // Valid tagged Fixnum range on LLP64: [ (LONG_MIN/2)<<1|1 , (LONG_MAX/2)<<1|1 ]
+    // = [ -2147483647 , 2147483647 ], i.e. it must fit in signed 32 bits.
+    asm.cmp(tagged, Opnd::Imm(0x7FFF_FFFF));
+    asm.jg(Target::side_exit(counter));
+    asm.cmp(tagged, Opnd::Imm(-0x7FFF_FFFF));
+    asm.jl(Target::side_exit(counter));
+}
+
 fn gen_opt_plus(
     jit: &mut JITState,
     asm: &mut Assembler,
@@ -1776,6 +1808,12 @@ fn gen_opt_plus(
         let arg0_untag = asm.sub(arg0, Opnd::Imm(1));
         let out_val = asm.add(arg0_untag, arg1);
         asm.jo(Target::side_exit(Counter::opt_plus_overflow));
+        // LLP64 (Windows): Fixnum is `long`-wide (RUBY_FIXNUM_MAX = LONG_MAX/2,
+        // and long is 32-bit) even though VALUE is 64-bit, so the 64-bit `jo`
+        // above only catches overflow at 2^63. A valid tagged fixnum fits in
+        // signed 32 bits; side-exit (promote to Bignum in the interpreter)
+        // when the result leaves that range.
+        guard_fixnum_in_long_range(asm, out_val, Counter::opt_plus_overflow);
 
         // Push the output on the stack
         let dst = asm.stack_push(Type::Fixnum);
@@ -2958,7 +2996,7 @@ fn gen_get_ivar(
         // The function could raise RactorIsolationError.
         jit_prepare_non_leaf_call(jit, asm);
 
-        let ivar_val = asm.ccall(rb_ivar_get as *const u8, vec![recv, Opnd::UImm(ivar_name)]);
+        let ivar_val = asm.ccall(rb_ivar_get as *const u8, vec![recv, Opnd::UImm(ivar_name as _)]);
 
         if recv_opnd != SelfOpnd {
             asm.stack_pop(1);
@@ -3038,7 +3076,7 @@ fn gen_get_ivar(
                 } else {
                     // The function could raise RactorIsolationError.
                     jit_prepare_non_leaf_call(jit, asm);
-                    asm.ccall(rb_ivar_get_at as *const u8, vec![recv, Opnd::UImm((ivar_index as u32).into()), Opnd::UImm(ivar_name)])
+                    asm.ccall(rb_ivar_get_at as *const u8, vec![recv, Opnd::UImm((ivar_index as u32).into()), Opnd::UImm(ivar_name as _)])
                 }
             };
 
@@ -3074,7 +3112,7 @@ fn gen_getinstancevariable(
         asm,
         GET_IVAR_MAX_DEPTH,
         comptime_val,
-        ivar_name,
+        ivar_name as _,
         self_asm_opnd,
         SelfOpnd,
     )
@@ -3173,7 +3211,7 @@ fn gen_setinstancevariable(
         jit,
         asm,
         comptime_receiver,
-        ivar_name,
+        ivar_name as _,
         SelfOpnd,
         Some(ic),
     )
@@ -3274,7 +3312,7 @@ fn gen_set_ivar(
                 rb_vm_set_ivar_id as *const u8,
                 vec![
                     recv,
-                    Opnd::UImm(ivar_name),
+                    Opnd::UImm(ivar_name as _),
                     val_opnd,
                 ],
             );
@@ -3442,7 +3480,7 @@ fn gen_definedivar(
     let shape_id = comptime_receiver.shape_id_of();
     let ivar_exists = unsafe {
         let mut ivar_index: attr_index_t = 0;
-        rb_shape_get_iv_index(shape_id, ivar_name, &mut ivar_index)
+        rb_shape_get_iv_index(shape_id, ivar_name as _, &mut ivar_index)
     };
 
     // Guard heap object (recv_opnd must be used before stack_pop)
@@ -4126,6 +4164,9 @@ fn gen_opt_minus(
         let val_untag = asm.sub(arg0, arg1);
         asm.jo(Target::side_exit(Counter::opt_minus_overflow));
         let val = asm.add(val_untag, Opnd::Imm(1));
+        // LLP64 (Windows): see gen_opt_plus. Side-exit when the tagged result
+        // leaves the signed-32-bit `long` fixnum range.
+        guard_fixnum_in_long_range(asm, val, Counter::opt_minus_overflow);
 
         // Push the output on the stack
         let dst = asm.stack_push(Type::Fixnum);
@@ -4169,6 +4210,9 @@ fn gen_opt_mult(
         let out_val = asm.mul(arg0_untag, arg1_untag);
         jit_chain_guard(JCC_JO_MUL, jit, asm, 1, Counter::opt_mult_overflow);
         let out_val = asm.add(out_val, Opnd::UImm(1));
+        // LLP64 (Windows): see gen_opt_plus. The 64-bit multiply overflow check
+        // misses the 31-bit `long` fixnum boundary.
+        guard_fixnum_in_long_range(asm, out_val, Counter::opt_mult_overflow);
 
         // Push the output on the stack
         let dst = asm.stack_push(Type::Fixnum);
@@ -4369,7 +4413,7 @@ fn gen_opt_duparray_send(
 ) -> Option<CodegenStatus> {
     let method = jit.get_arg(1).as_u64();
 
-    if method == ID!(include_p) {
+    if method == ID!(include_p) as u64 {
         gen_opt_duparray_send_include_p(jit, asm)
     } else {
         None
@@ -5468,6 +5512,8 @@ fn jit_rb_int_succ(
     asm_comment!(asm, "Integer#succ");
     let out_val = asm.add(recv, Opnd::Imm(2)); // 2 is untagged Fixnum 1
     asm.jo(Target::side_exit(Counter::opt_succ_overflow));
+    // LLP64 (Windows): see gen_opt_plus.
+    guard_fixnum_in_long_range(asm, out_val, Counter::opt_succ_overflow);
 
     // Push the output onto the stack
     let dst = asm.stack_push(Type::Fixnum);
@@ -5497,6 +5543,7 @@ fn jit_rb_int_pred(
     asm_comment!(asm, "Integer#pred");
     let out_val = asm.sub(recv, Opnd::Imm(2)); // 2 is untagged Fixnum 1
     asm.jo(Target::side_exit(Counter::send_pred_underflow));
+    guard_fixnum_in_long_range(asm, out_val, Counter::send_pred_underflow);
 
     // Push the output onto the stack
     let dst = asm.stack_push(Type::Fixnum);
@@ -5600,6 +5647,7 @@ fn fixnum_left_shift_body(asm: &mut Assembler, lhs: Opnd, shift_amt: u64) {
 
     // Re-tag the output value
     let out_val = asm.add(out_val, 1.into());
+    guard_fixnum_in_long_range(asm, out_val, Counter::lshift_overflow);
 
     let ret_opnd = asm.stack_push(Type::Fixnum);
     asm.mov(ret_opnd, out_val);
@@ -5944,6 +5992,22 @@ fn jit_rb_str_length(
     true
 }
 
+/// Read a C `long`-width length field (RSTRING_LEN, RARRAY heap len) as a full
+/// VALUE-width operand. On LP64 `long` is already VALUE-width; on LLP64
+/// (Windows) it is 32-bit, so read a full word at the offset and mask to the
+/// low `long` bits. Lengths are non-negative, so this zero-extends correctly
+/// and avoids mixing a 32-bit field with 64-bit operands (which would trip the
+/// backend's operand-size assertions).
+fn load_long_len_field(asm: &mut Assembler, base: Opnd, offset: i32) -> Opnd {
+    let long_bits = std::os::raw::c_long::BITS as u8;
+    if long_bits < VALUE_BITS {
+        let raw = Opnd::mem(VALUE_BITS, base, offset);
+        asm.and(raw, ((1u64 << long_bits) - 1).into())
+    } else {
+        asm.load(Opnd::mem(long_bits, base, offset))
+    }
+}
+
 fn jit_rb_str_bytesize(
     _jit: &mut JITState,
     asm: &mut Assembler,
@@ -5958,13 +6022,8 @@ fn jit_rb_str_bytesize(
     let recv = asm.stack_pop(1);
 
     asm_comment!(asm, "get string length");
-    let str_len_opnd = Opnd::mem(
-        std::os::raw::c_long::BITS as u8,
-        asm.load(recv),
-        RUBY_OFFSET_RSTRING_LEN as i32,
-    );
-
-    let len = asm.load(str_len_opnd);
+    let str_reg = asm.load(recv);
+    let len = load_long_len_field(asm, str_reg, RUBY_OFFSET_RSTRING_LEN as i32);
     let shifted_val = asm.lshift(len, Opnd::UImm(1));
     let out_val = asm.or(shifted_val, Opnd::UImm(RUBY_FIXNUM_FLAG as u64));
 
@@ -6131,11 +6190,7 @@ fn jit_rb_str_getbyte(
 
     asm_comment!(asm, "get string length");
     let recv = asm.load(recv);
-    let str_len_opnd = Opnd::mem(
-        std::os::raw::c_long::BITS as u8,
-        asm.load(recv),
-        RUBY_OFFSET_RSTRING_LEN as i32,
-    );
+    let str_len_opnd = load_long_len_field(asm, recv, RUBY_OFFSET_RSTRING_LEN as i32);
 
     // Exit if the index is out of bounds
     asm.cmp(idx, str_len_opnd);
@@ -6702,7 +6757,7 @@ fn jit_thread_s_current(
     asm.stack_pop(1);
 
     // ec->thread_ptr
-    let ec_thread_opnd = asm.load(Opnd::mem(64, EC, RUBY_OFFSET_EC_THREAD_PTR as i32));
+    let ec_thread_opnd = asm.load(Opnd::mem(64, EC, unsafe { rb_yjit_ec_thread_ptr_offset() }));
 
     // thread->self
     let thread_self = Opnd::mem(64, ec_thread_opnd, RUBY_OFFSET_THREAD_SELF);
@@ -6761,7 +6816,7 @@ fn c_method_tracing_currently_enabled(jit: &JITState) -> bool {
 unsafe extern "C" fn build_kwhash(ci: *const rb_callinfo, sp: *const VALUE) -> VALUE {
     let kw_arg = vm_ci_kwarg(ci);
     let kw_len: usize = get_cikw_keyword_len(kw_arg).try_into().unwrap();
-    let hash = rb_hash_new_with_size(kw_len as u64);
+    let hash = rb_hash_new_with_size(kw_len as _);
 
     for kwarg_idx in 0..kw_len {
         let key = get_cikw_keywords_idx(kw_arg, kwarg_idx.try_into().unwrap());
@@ -7304,22 +7359,31 @@ fn get_array_len(asm: &mut Assembler, array_opnd: Opnd) -> Opnd {
     let emb_len_opnd = asm.and(flags_opnd, (RARRAY_EMBED_LEN_MASK as u64).into());
     let emb_len_opnd = asm.rshift(emb_len_opnd, (RARRAY_EMBED_LEN_SHIFT as u64).into());
 
-    // Conditionally move the length of the heap array
-    let flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
-    asm.test(flags_opnd, (RARRAY_EMBED_FLAG as u64).into());
-
     let array_reg = match array_opnd {
         Opnd::InsnOut { .. } => array_opnd,
         _ => asm.load(array_opnd),
     };
-    let array_len_opnd = Opnd::mem(
-        std::os::raw::c_long::BITS as u8,
-        array_reg,
-        RUBY_OFFSET_RARRAY_AS_HEAP_LEN,
-    );
+    // Keep the heap length as a memory operand of the csel: materializing it
+    // in a register first runs out of allocatable registers on Windows.
+    let array_len_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RARRAY_AS_HEAP_LEN);
+
+    // Conditionally move the length of the heap array
+    let flags_opnd = Opnd::mem(VALUE_BITS, array_reg, RUBY_OFFSET_RBASIC_FLAGS);
+    asm.test(flags_opnd, (RARRAY_EMBED_FLAG as u64).into());
 
     // Select the array length value
-    asm.csel_nz(emb_len_opnd, array_len_opnd)
+    let len = asm.csel_nz(emb_len_opnd, array_len_opnd);
+
+    // On LLP64 (Windows) `long` is 32-bit, so the heap length field is narrower
+    // than VALUE and the word read above has the adjacent field in its upper
+    // half. Lengths are non-negative, so masking to the low `long` bits
+    // zero-extends it (and leaves the small embedded length unchanged).
+    let long_bits = std::os::raw::c_long::BITS as u8;
+    if long_bits < VALUE_BITS {
+        asm.and(len, ((1u64 << long_bits) - 1).into())
+    } else {
+        len
+    }
 }
 
 // Generate RARRAY_CONST_PTR (part of RARRAY_AREF)
@@ -7453,7 +7517,7 @@ fn gen_send_bmethod(
     if !procv.shareable_p() {
         let ractor_serial = unsafe { rb_yjit_cme_ractor_serial(cme) };
         asm_comment!(asm, "guard current ractor == {}", ractor_serial);
-        let current_ractor_serial = asm.load(Opnd::mem(64, EC, RUBY_OFFSET_EC_RACTOR_ID as i32));
+        let current_ractor_serial = asm.load(Opnd::mem(64, EC, unsafe { rb_yjit_ec_ractor_id_offset() }));
         asm.cmp(current_ractor_serial, ractor_serial.into());
         asm.jne(Target::side_exit(Counter::send_bmethod_ractor));
     }
@@ -7792,7 +7856,12 @@ fn gen_send_iseq(
     if let (None, Some(builtin_info), true, false, None | Some(0)) =
            (block, builtin_func, builtin_attrs & BUILTIN_ATTR_LEAF != 0, opt_send_call, splat_array_length) {
         let builtin_argc = unsafe { (*builtin_info).argc };
-        if builtin_argc + 1 < (C_ARG_OPNDS.len() as i32) {
+        // Windows x64 has only 4 argument registers, but ccall() spills further
+        // arguments onto the stack (MS x64 ABI), so builtins can take the same
+        // arity as the 6-register SysV ABI instead of side-exiting early. Using
+        // the SysV register count as the limit keeps parity across platforms.
+        let arg_reg_limit: i32 = if cfg!(windows) { 6 } else { C_ARG_OPNDS.len() as i32 };
+        if builtin_argc + 1 < arg_reg_limit {
             // We pop the block arg without using it because:
             //  - the builtin is leaf, so it promises to not `yield`.
             //  - no leaf builtins have block param at the time of writing, and
@@ -8579,7 +8648,7 @@ fn gen_iseq_kw_call(
 
                 // Use the total number of supplied keywords as a size upper bound
                 let keyword_len = unsafe { (*keywords).keyword_len } as usize;
-                let hash = unsafe { rb_hash_new_with_size(keyword_len as u64) };
+                let hash = unsafe { rb_hash_new_with_size(keyword_len as _) };
 
                 // Put pairs into the kwrest hash as the mask describes
                 for kwarg_idx in 0..keyword_len {
@@ -8954,7 +9023,7 @@ fn gen_struct_aref(
 
     // Confidence checks
     assert!(unsafe { RB_TYPE_P(comptime_recv, RUBY_T_STRUCT) });
-    assert!((off as i64) < unsafe { RSTRUCT_LEN(comptime_recv) });
+    assert!((off as i64) < i64::from(unsafe { RSTRUCT_LEN(comptime_recv) }));
 
     // We are going to use an encoding that takes a 4-byte immediate which
     // limits the offset to INT32_MAX.
@@ -9038,7 +9107,7 @@ fn gen_struct_aset(
 
     // Confidence checks
     assert!(unsafe { RB_TYPE_P(comptime_recv, RUBY_T_STRUCT) });
-    assert!((off as i64) < unsafe { RSTRUCT_LEN(comptime_recv) });
+    assert!((off as i64) < i64::from(unsafe { RSTRUCT_LEN(comptime_recv) }));
 
     // Even if the comptime recv was not frozen, future recv may be. So we need to emit a guard
     // that the recv is not frozen.
@@ -9313,7 +9382,7 @@ fn gen_send_general(
                     asm,
                     SEND_MAX_DEPTH,
                     comptime_recv,
-                    ivar_name,
+                    ivar_name as _,
                     recv,
                     recv.into(),
                 );
@@ -9559,7 +9628,7 @@ fn get_class_name(class: Option<VALUE>) -> String {
 }
 
 /// Assemble "{class_name}#{method_name}" from a class pointer and a method ID
-fn get_method_name(class: Option<VALUE>, mid: u64) -> String {
+fn get_method_name(class: Option<VALUE>, mid: ID) -> String {
     let class_name = get_class_name(class);
     let method_name = if mid != 0 {
         unsafe { cstr_to_rust_string(rb_id2name(mid)) }
@@ -10732,8 +10801,11 @@ fn gen_invokebuiltin(
     let bf: *const rb_builtin_function = jit.get_arg(0).as_ptr();
     let bf_argc: usize = unsafe { (*bf).argc }.try_into().expect("non negative argc");
 
-    // ec, self, and arguments
-    if bf_argc + 2 > C_ARG_OPNDS.len() {
+    // ec, self, and arguments. Windows x64 has 4 argument registers, but
+    // ccall() spills further arguments onto the stack, so allow the same
+    // arity as the 6-register SysV ABI instead of side-exiting early.
+    let arg_reg_limit = if cfg!(windows) { 6 } else { C_ARG_OPNDS.len() };
+    if bf_argc + 2 > arg_reg_limit {
         incr_counter!(invokebuiltin_too_many_args);
         return None;
     }
@@ -10771,8 +10843,10 @@ fn gen_opt_invokebuiltin_delegate(
     let bf_argc = unsafe { (*bf).argc };
     let start_index = jit.get_arg(1).as_i32();
 
-    // ec, self, and arguments
-    if bf_argc + 2 > (C_ARG_OPNDS.len() as i32) {
+    // ec, self, and arguments. See gen_invokebuiltin: on Windows ccall()
+    // spills args beyond the 4 registers, so match the SysV arity limit.
+    let arg_reg_limit = if cfg!(windows) { 6 } else { C_ARG_OPNDS.len() as i32 };
+    if bf_argc + 2 > arg_reg_limit {
         incr_counter!(invokebuiltin_too_many_args);
         return None;
     }

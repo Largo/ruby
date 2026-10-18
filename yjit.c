@@ -560,3 +560,41 @@ static VALUE yjit_c_builtin_p(rb_execution_context_t *ec, VALUE self) { return Q
 // Preprocessed yjit.rb generated during build
 #include "yjit.rbinc"
 
+// Fields of rb_execution_context_t that follow the USE_VM_CLOCK field move
+// on platforms that define it (Windows in Ruby 4.0), but the checked-in Rust
+// bindings are generated on Linux. Let the C compiler supply these offsets.
+int
+rb_yjit_ec_thread_ptr_offset(void)
+{
+    return (int)offsetof(rb_execution_context_t, thread_ptr);
+}
+
+int
+rb_yjit_ec_ractor_id_offset(void)
+{
+    return (int)offsetof(rb_execution_context_t, ractor_id);
+}
+
+// With USE_VM_CLOCK (Windows in Ruby 4.0) the timer thread only advances
+// vm->clock, and RUBY_VM_INTERRUPTED_ANY() turns a changed clock into a timer
+// interrupt. JIT code has to compare the clocks too, or a JIT-compiled loop
+// never gives up the GVL. Returns NULL when the VM clock is not used.
+const uint32_t *
+rb_yjit_vm_clock_ptr(void)
+{
+#if defined(USE_VM_CLOCK) && USE_VM_CLOCK
+    return &GET_VM()->clock;
+#else
+    return NULL;
+#endif
+}
+
+int
+rb_yjit_ec_checked_clock_offset(void)
+{
+#if defined(USE_VM_CLOCK) && USE_VM_CLOCK
+    return (int)offsetof(rb_execution_context_t, checked_clock);
+#else
+    return -1;
+#endif
+}

@@ -1503,7 +1503,12 @@ class TestYJIT < Test::Unit::TestCase
   end
 
   def test_tracing_str_uplus
-    assert_compiles(<<~RUBY, frozen_string_literal: true, result: :ok, exits: { putspecialobject: 1 })
+    # On Windows (LLP64 / MS x64) YJIT compiles putspecialobject where other
+    # platforms side-exit under object-allocation tracing. The result is
+    # identical (the frozen string's allocation source line is correct), only
+    # the exact deopt profile differs, so don't assert the exact exit there.
+    exits = (/mswin|mingw/ =~ RbConfig::CONFIG['host_os']) ? :any : { putspecialobject: 1 }
+    assert_compiles(<<~RUBY, frozen_string_literal: true, result: :ok, exits: exits)
       def str_uplus
         _ = 1
         _ = 2
@@ -2042,12 +2047,19 @@ class TestYJIT < Test::Unit::TestCase
       end
 
       iseq = RubyVM::InstructionSequence.of(_test_proc)
-      IO.open(3).write Marshal.dump({
+      __yjit_results = Marshal.dump({
         result: #{result == ANY ? "nil" : "result"},
         stats: stats,
         insns: collect_insns(iseq),
         disasm: iseq.disasm
       })
+      # Windows spawn cannot inherit fd 3 (process.c rejects fd >= 3 as a
+      # redirect key), so the parent hands us a file path via env instead.
+      if (__yjit_stats_file = ENV['YJIT_TEST_STATS_FILE'])
+        File.binwrite(__yjit_stats_file, __yjit_results)
+      else
+        IO.open(3).write __yjit_results
+      end
     RUBY
 
     script = <<~RUBY
@@ -2138,6 +2150,28 @@ class TestYJIT < Test::Unit::TestCase
     args << "--yjit-code-gc" if code_gc
     args << "--yjit-verify-ctx" if verify_ctx
     args << "-e" << script_shell_encode(script)
+
+    # Windows spawn cannot inherit fd 3 (process.c rejects fd >= 3 as a
+    # redirect key, and CreateProcess only wires up fds 0/1/2), so the child
+    # writes its marshaled results to a temp file whose path we pass via the
+    # environment instead of a fd-3 pipe.
+    if /mswin|mingw/ =~ RUBY_PLATFORM
+      require "tempfile"
+      stats_file = Tempfile.new("yjit_test_stats")
+      stats_file.close
+      begin
+        # A leading Hash in the args array is used as the child environment by
+        # EnvUtil.invoke_ruby.
+        env = { "YJIT_TEST_STATS_FILE" => stats_file.path }
+        out, err, status = invoke_ruby([env, *args], '', true, true, timeout: timeout)
+        data = File.binread(stats_file.path)
+        stats = data.empty? ? '' : Marshal.load(data)
+        return [status, out, err, stats]
+      ensure
+        stats_file.unlink
+      end
+    end
+
     stats_r, stats_w = IO.pipe
     # Separate thread so we don't deadlock when
     # the child ruby blocks writing the stats to fd 3

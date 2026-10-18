@@ -143,12 +143,25 @@ macro_rules! c_callable {
     };
 }
 
-#[cfg(target_arch = "x86_64")]
+// On non-Windows x86_64, pin the SysV convention explicitly (matches the
+// generated code's register assignment). On Windows x86_64 the generated
+// code uses the native MS x64 ABI (RCX/RDX/R8/R9), so these callbacks must
+// use `extern "C"` (= MS x64) instead of sysv64, otherwise their arguments
+// would be read from the wrong registers.
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 macro_rules! c_callable {
     ($(#[$outer:meta])*
     fn $f:ident $args:tt $(-> $ret:ty)? $body:block) => {
         $(#[$outer])*
         extern "sysv64" fn $f $args $(-> $ret)? $body
+    };
+}
+#[cfg(all(target_arch = "x86_64", windows))]
+macro_rules! c_callable {
+    ($(#[$outer:meta])*
+    fn $f:ident $args:tt $(-> $ret:ty)? $body:block) => {
+        $(#[$outer])*
+        extern "C" fn $f $args $(-> $ret)? $body
     };
 }
 pub(crate) use c_callable;

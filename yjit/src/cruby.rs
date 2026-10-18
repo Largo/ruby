@@ -113,10 +113,22 @@ pub use autogened::*;
 // Use bindgen for functions that are defined in headers or in yjit.c.
 #[cfg_attr(test, allow(unused))] // We don't link against C code when testing
 extern "C" {
+    // Fixnum-or-Bignum from a 64-bit unsigned. Used by num_from_usize to pack
+    // counter values that overflow the (LLP64) Fixnum range.
+    pub fn rb_ull2inum(n: std::os::raw::c_ulonglong) -> VALUE;
+
     pub fn rb_check_overloaded_cme(
         me: *const rb_callable_method_entry_t,
         ci: *const rb_callinfo,
     ) -> *const rb_callable_method_entry_t;
+
+    // Offsets of rb_execution_context_t fields whose position is platform
+    // dependent (see yjit.c); use these instead of the bindgen constants.
+    pub fn rb_yjit_ec_thread_ptr_offset() -> std::os::raw::c_int;
+    pub fn rb_yjit_ec_ractor_id_offset() -> std::os::raw::c_int;
+    // VM clock used for timer interrupts on Windows (see yjit.c), or NULL
+    pub fn rb_yjit_vm_clock_ptr() -> *const u32;
+    pub fn rb_yjit_ec_checked_clock_offset() -> std::os::raw::c_int;
 
     // Floats within range will be encoded without creating objects in the heap.
     // (Range is 0x3000000000000001 to 0x4fffffffffffffff (1.7272337110188893E-77 to 2.3158417847463237E+77).
@@ -538,6 +550,19 @@ impl VALUE {
         let k: usize = item.wrapping_add(item.wrapping_add(1));
         VALUE(k)
     }
+
+    /// Convert a `usize` to a Ruby Integer, promoting to a Bignum when it
+    /// exceeds the Fixnum range. On LLP64 (Windows) the Fixnum range is only
+    /// ±2^30 (RUBY_FIXNUM_MAX = LONG_MAX/2, long is 32-bit), so counter values
+    /// (e.g. RubyVM::YJIT.runtime_stats) routinely overflow a Fixnum, where
+    /// `fixnum_from_usize` would assert. This is the safe converter.
+    pub fn num_from_usize(item: usize) -> Self {
+        if item <= (RUBY_FIXNUM_MAX as usize) {
+            Self::fixnum_from_usize(item)
+        } else {
+            unsafe { rb_ull2inum(item as std::os::raw::c_ulonglong) }
+        }
+    }
 }
 
 impl From<IseqPtr> for VALUE {
@@ -605,7 +630,7 @@ pub unsafe fn cfp_env_has_escaped(cfp: *mut rb_control_frame_struct) -> bool {
 
 /// Produce a Ruby string from a Rust string slice
 pub fn rust_str_to_ruby(str: &str) -> VALUE {
-    unsafe { rb_utf8_str_new(str.as_ptr() as *const _, str.len() as i64) }
+    unsafe { rb_utf8_str_new(str.as_ptr() as *const _, str.len() as _) }
 }
 
 /// Produce a Ruby symbol from a Rust string slice
@@ -789,7 +814,7 @@ pub use manual_defs::*;
 /// Interned ID values for Ruby symbols and method names.
 /// See [type@crate::cruby::ID] and usages outside of YJIT.
 pub(crate) mod ids {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::AtomicUsize;
     /// Globals to cache IDs on boot. Atomic to use with relaxed ordering
     /// so reads can happen without `unsafe`. Synchronization done through
     /// the VM lock.
@@ -797,7 +822,7 @@ pub(crate) mod ids {
         ($(name: $ident:ident content: $str:literal)*) => {
             $(
                 #[doc = concat!("[type@crate::cruby::ID] for `", stringify!($str), "`")]
-                pub static $ident: AtomicU64 = AtomicU64::new(0);
+                pub static $ident: AtomicUsize = AtomicUsize::new(0);
             )*
 
             pub(crate) fn init() {

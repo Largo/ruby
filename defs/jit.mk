@@ -65,6 +65,49 @@ $(JIT_RLIB): target/.rustc-version
 endif # ifneq ($(JIT_CARGO_SUPPORT),no)
 
 RUST_LIB_SYMBOLS = $(RUST_LIB:.a=).symbols
+ifneq ($(findstring mingw,$(target_os)),)
+# RUST_LIBOBJ is an archive here, and an archive nested inside the static
+# libruby is invisible to the linker (mkmf's have_func probes link against
+# it). Keep it out of the ar command line and merge its members instead;
+# ADDLIB copes with the duplicate member names of Rust archives. The path is
+# made relative because the MRI script is not subject to MSYS path conversion.
+LIBRUBY_A_OBJS := $(filter-out $(RUST_LIBOBJ),$(LIBRUBY_A_OBJS))
+LIBRUBY_A_MERGE = $(if $(RUST_LIB),printf 'OPEN %s\nADDLIB %s\nSAVE\nEND\n' '$@' '$(RUST_LIBOBJ:$(TOP_BUILD_DIR)/%=%)' | $(AR) -M,:)
+# Export only Ruby's own symbols from the DLL, not the Rust internals (whose
+# mangled names are not even valid in a .def file).
+RUBYDEF_OBJS = $(LIBRUBY_A_OBJS) $(INITOBJS)
+# The members of the Rust archive cannot be localized on PE (no `ld -r`), so
+# leave them out of the leaked-globals check; the DLL exports are still checked.
+LEAKED_GLOBALS_OBJS = $(filter-out $(RUST_LIBOBJ),$(COMMONOBJS))
+
+# binutils `ld -r` cannot partial-link the TLS directory the Rust std emits
+# on PE ("unable to fill in DataDirectory[9]: _tls_used not defined
+# correctly"). Instead, make a localized *copy of the archive*: objcopy
+# rewrites each member's symbol table (no TLS-merging `ld -r` involved),
+# hiding everything but rb_* so Rust's bundled compiler_builtins (lgamma_r,
+# etc.) don't collide with Ruby's own missing/*.c. The linker then pulls
+# members from this archive like any other library input.
+# RUST_LIBOBJ is $(RUST_LIB:.a=.localized.a) here (set by configure, so that
+# common.mk sees the same name when it expands the miniruby prerequisites).
+# Unlike the Linux path we cannot `ld -r`-merge the archive first (PE TLS
+# limitation), so we must NOT blanket-localize every non-rb_* symbol -- that
+# would sever the cross-CGU references inside the Rust static lib (fmt impls,
+# rust_eh_personality, ...). Instead localize ONLY the symbols that actually
+# collide with Ruby's own definitions (compiler_builtins math intrinsics vs
+# missing/lgamma_r.o etc.), computed as the intersection of the archive's
+# globals with $(MISSING)'s globals.
+$(RUST_LIBOBJ): $(RUST_LIB) $(MISSING)
+	$(ECHO) 'localizing collisions in $(RUST_LIB) into $@ (mingw)'
+	$(Q) $(CP) $(RUST_LIB) $@
+	$(Q) for m in `ar t $@ | grep '\.dwo$$'`; do ar d $@ "$$m"; done
+	$(Q) nm -g --defined-only $(MISSING) 2>/dev/null | awk 'NF==3 {print $$3}' | sort -u > $@.miss.syms
+	$(Q) nm -g --defined-only $@ 2>/dev/null | awk 'NF==3 {print $$3}' | sort -u > $@.rust.syms
+	$(Q) comm -12 $@.miss.syms $@.rust.syms > $@.collide.syms
+	$(Q) if [ -s $@.collide.syms ]; then \
+	        $(ECHO) "localizing collisions:" `tr '\n' ' ' < $@.collide.syms`; \
+	        objcopy --localize-symbols=$@.collide.syms $@; \
+	     fi
+else
 $(RUST_LIBOBJ): $(RUST_LIB)
 	$(ECHO) 'partial linking $(RUST_LIB) into $@'
 ifneq ($(findstring darwin,$(target_os)),)
@@ -72,6 +115,7 @@ ifneq ($(findstring darwin,$(target_os)),)
 else
 	$(Q) $(LD) -r -o $@ --whole-archive $(RUST_LIB)
 	-$(Q) $(OBJCOPY) --wildcard --keep-global-symbol='$(SYMBOL_PREFIX)rb_*' $(@)
+endif
 endif
 
 rust-libobj: $(RUST_LIBOBJ)

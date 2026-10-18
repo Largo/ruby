@@ -5555,3 +5555,32 @@ assert_equal "ok", %q{
   many_locals
   "ok"
 }
+
+# Thread.current reads ec->thread_ptr, whose offset is platform dependent
+assert_equal 'Thread', %q{
+  def thread_current = Thread.current
+  thread_current
+  thread_current.class.name
+}
+
+assert_equal '1', %q{
+  def set_thread_local(v) = Thread.current[:yjit_thread_local] = v
+  set_thread_local(0)
+  set_thread_local(1)
+  Thread.current[:yjit_thread_local].to_s
+}
+
+# A JIT-compiled loop has to let other threads run. With USE_VM_CLOCK
+# (Windows) the timer only advances vm->clock, which JIT code must check.
+assert_equal 'ok', %q{
+  def spin
+    i = 0
+    while true
+      i += 1
+    end
+  end
+  spin_thread = Thread.new { spin }
+  sleep 0.1
+  spin_thread.kill
+  :ok
+}

@@ -3931,7 +3931,7 @@ AS_IF([test "$RUSTC" != "no"],
     AC_MSG_CHECKING([whether ${RUSTC} works for YJIT])
     AS_CASE(["$target_cpu"],
         [arm64|aarch64], [JIT_TARGET_ARCH=aarch64],
-        [x86_64], [JIT_TARGET_ARCH=x86_64],
+        [x86_64|x64], [JIT_TARGET_ARCH=x86_64],
     )
     dnl Fails in case rustc target doesn't match ruby target.
     dnl Can happen on Rosetta, for example.
@@ -3962,12 +3962,22 @@ AS_IF([test "$cross_compiling" = no],
     )
 )
 
+dnl YJIT additionally supports the native Microsoft x64 ABI on MinGW.
+dnl Keep this separate from JIT_TARGET_OK so this does not implicitly enable
+dnl the experimental ZJIT on a platform it has not enabled itself.
+YJIT_TARGET_OK=$JIT_TARGET_OK
+AS_IF([test "$cross_compiling" = no],
+    AS_CASE(["$target_cpu-$target_os"],
+        [x86_64-*mingw*|x64-*mingw*], [YJIT_TARGET_OK=yes]
+    )
+)
+
 dnl build YJIT in release mode if rustc >= 1.58.0 is present and we are on a supported platform
 AC_ARG_ENABLE(yjit,
     AS_HELP_STRING([--enable-yjit],
     [enable in-process JIT compiler that requires Rust build tools. enabled by default on supported platforms if rustc 1.58.0+ is available]),
     [YJIT_SUPPORT=$enableval],
-    [AS_CASE(["$JIT_TARGET_OK:$JIT_RUSTC_OK"],
+    [AS_CASE(["$YJIT_TARGET_OK:$JIT_RUSTC_OK"],
         [yes:yes], [
             YJIT_SUPPORT=yes
         ],
@@ -4034,6 +4044,10 @@ AS_CASE(["${YJIT_SUPPORT}"],
         AC_DEFINE_UNQUOTED(YJIT_SUPPORT, [$YJIT_SUPPORT])
     ])
     AC_DEFINE(USE_YJIT, 1)
+    AS_CASE(["$target_os"], [mingw*], [
+        dnl system libraries the Rust standard library (staticlib) pulls in
+        LIBS="$LIBS -lbcrypt -lntdll -luserenv -lsynchronization"
+    ])
 ], [
     AC_DEFINE(USE_YJIT, 0)
 ])
@@ -4133,6 +4147,13 @@ AS_IF([test -n "$RUST_LIB"], [
     # absolute path to stop the "target" dir in src dir from interfering through VPATH
     RUST_LIB='$(TOP_BUILD_DIR)'/"${RUST_LIB}"
 ])
+
+dnl On MinGW the Rust staticlib is linked as a symbol-localized archive copy
+dnl instead of a partially linked object (see defs/jit.mk).
+AS_CASE(["$target_os"],
+    [mingw*], [RUST_LIBOBJ_SUFFIX=.localized.a],
+    [RUST_LIBOBJ_SUFFIX=.$OBJEXT])
+AC_SUBST(RUST_LIBOBJ_SUFFIX)
 
 dnl These variables end up in ::RbConfig::CONFIG
 AC_SUBST(RUSTC)dnl Rust compiler command
